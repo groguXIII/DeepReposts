@@ -100,6 +100,8 @@ class MainActivity : Activity() {
     private lateinit var tvUpd: TextView
     private lateinit var bar: ProgressBar
     private lateinit var btnDelete: Button
+    private lateinit var loginBar: LinearLayout
+    private lateinit var tvLoginInfo: TextView
 
     private var mode = Mode.LOGIN
     private var armed = false
@@ -142,15 +144,20 @@ class MainActivity : Activity() {
         appLayer.addView(settingsView, FrameLayout.LayoutParams(MATCH, MATCH))
         appLayer.visibility = View.GONE
         root.addView(appLayer, FrameLayout.LayoutParams(MATCH, MATCH))
+        loginBar = buildLoginBar()
+        root.addView(loginBar, FrameLayout.LayoutParams(MATCH, WRAP, Gravity.BOTTOM))
         setContentView(root)
 
         askNotifications()
         user = prefs.getString("user", "") ?: ""
         val cached = prefs.getString("avatar", "") ?: ""
         if (cached.isNotEmpty()) showAvatar(cached)
-        val hasSession = CookieManager.getInstance().getCookie("https://www.tiktok.com")?.contains("sessionid=") == true
-        if (user.isNotEmpty() && hasSession) { showApp(); startCollect() } else showLogin()
+        if (user.isNotEmpty() && sessionOk()) { showApp(); startCollect() } else showLogin()
     }
+
+    override fun onPause() { CookieManager.getInstance().flush(); super.onPause() }
+
+    override fun onStop() { CookieManager.getInstance().flush(); super.onStop() }
 
     override fun onResume() { super.onResume(); if (::rv.isInitialized && mode == Mode.IDLE) refresh() }
 
@@ -208,6 +215,7 @@ class MainActivity : Activity() {
         web.destroy()
         web = makeWeb()
         root.addView(web, if (idx < 0) 0 else idx, FrameLayout.LayoutParams(MATCH, MATCH))
+        webMargin(if (mode == Mode.LOGIN) dp(60) else 0)
         web.settings.blockNetworkImage = mode == Mode.COLLECT || mode == Mode.DELETE
         when {
             running -> { armed = true; tries = 0; web.loadUrl(queue[qi].url) }
@@ -228,26 +236,63 @@ class MainActivity : Activity() {
     }
 
     // ---------- вход ----------
+    private fun sessionOk(): Boolean {
+        val c = CookieManager.getInstance().getCookie("https://www.tiktok.com") ?: return false
+        return c.contains("sessionid=") || c.contains("sid_tt=") || c.contains("sid_guard=")
+    }
+
+    private fun webMargin(px: Int) {
+        web.layoutParams = FrameLayout.LayoutParams(MATCH, MATCH).apply { bottomMargin = px }
+    }
+
     private val poll = object : Runnable {
         override fun run() {
             if (mode != Mode.LOGIN) return
-            val cookies = CookieManager.getInstance().getCookie("https://www.tiktok.com") ?: ""
-            if (!cookies.contains("sessionid=")) { loginPolls = 0; ui.postDelayed(this, 2000); return }
+            CookieManager.getInstance().flush()   // чтобы вход не терялся после закрытия приложения
+            if (!sessionOk()) {
+                loginPolls = 0
+                tvLoginInfo.text = "Войдите в TikTok на странице выше"
+                ui.postDelayed(this, 2000)
+                return
+            }
             loginPolls++
-            if (loginPolls == 1) toast("Вход выполнен, определяю аккаунт…")
+            tvLoginInfo.text = "Вход выполнен, определяю аккаунт… ($loginPolls)"
             web.evaluateJavascript(Scripts.USER) { r ->
                 val name = (r ?: "").trim('"')
                 if (name.isNotEmpty() && name != "null" && mode == Mode.LOGIN) {
                     loggedIn(name)
                     return@evaluateJavascript
                 }
-                // после входа страница не перезагружается и «не знает» аккаунт — загружаем главную заново
-                if (loginPolls == 3 && !reloadedForUser) { reloadedForUser = true; web.loadUrl("https://www.tiktok.com/") }
-                // не получилось определить — просим ввести юзернейм вручную
+                // если страница входа уже закрылась, а аккаунт не виден — открываем главную заново
+                if (loginPolls == 8 && !reloadedForUser && !(web.url ?: "").contains("login")) {
+                    reloadedForUser = true
+                    web.loadUrl("https://www.tiktok.com/")
+                }
                 if (loginPolls >= 15 && !askedName) { askedName = true; askUsername() }
                 ui.postDelayed(this, 2000)
             }
         }
+    }
+
+    /** Кнопка «Я вошёл(а)»: не ждём автоопределения. */
+    private fun manualLogin() {
+        if (!sessionOk()) { toast("Вход в TikTok ещё не выполнен. Войдите на странице выше."); return }
+        web.evaluateJavascript(Scripts.USER) { r ->
+            val name = (r ?: "").trim('"')
+            if (name.isNotEmpty() && name != "null") loggedIn(name) else askUsername()
+        }
+    }
+
+    private fun buildLoginBar(): LinearLayout {
+        val lb = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(BG); setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+        tvLoginInfo = TextView(this).apply { textSize = 12f; setTextColor(ICE); text = "Войдите в TikTok на странице выше" }
+        lb.addView(tvLoginInfo, LinearLayout.LayoutParams(0, WRAP, 1f))
+        lb.addView(button("Я вошёл(а)", true).apply { textSize = 14f; setOnClickListener { manualLogin() } },
+            LinearLayout.LayoutParams(WRAP, dp(44)).apply { leftMargin = dp(8) })
+        return lb
     }
 
     private fun askUsername() {
@@ -267,12 +312,16 @@ class MainActivity : Activity() {
         loginPolls = 0; reloadedForUser = false; askedName = false
         appLayer.visibility = View.GONE
         settingsView.visibility = View.GONE
+        loginBar.visibility = View.VISIBLE
+        webMargin(dp(60))
         web.loadUrl("https://www.tiktok.com/login")
         ui.removeCallbacks(poll); ui.postDelayed(poll, 2000)
     }
 
     private fun showApp() {
         appLayer.visibility = View.VISIBLE
+        loginBar.visibility = View.GONE
+        webMargin(0)
         tvUser.text = "@$user"
     }
 
@@ -280,6 +329,7 @@ class MainActivity : Activity() {
         if (name != user) { items.clear(); seen.clear(); gridAdapter.notifyDataSetChanged() }
         user = name
         prefs.edit().putString("user", name).apply()
+        CookieManager.getInstance().flush()
         showApp()
         startCollect()
     }
