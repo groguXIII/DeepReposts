@@ -382,27 +382,43 @@ object Scripts {
     // открывает вкладку «Репосты», прокручивает до конца, собирает ссылки и превью
     const val COLLECT = """(async function(){
   var sleep=function(ms){return new Promise(function(r){setTimeout(r,ms);});};
-  var tab=document.querySelector('[data-e2e="repost-tab"]');
-  if(!tab){
-    var all=document.querySelectorAll('[role="tab"],[role="button"],p,span,div');
-    for(var i=0;i<all.length;i++){
-      var e=all[i];
-      var t=(e.textContent||'').trim();
-      if(e.children.length===0&&(t==='Reposts'||t==='Репосты')){tab=e;break;}
+  var rx=/repost|репост/i;
+  function tabs(){return Array.prototype.slice.call(document.querySelectorAll('[role="tab"]'));}
+  function find(){
+    var e=document.querySelector('[data-e2e="repost-tab"]');
+    if(e)return e;
+    var t=tabs();
+    for(var i=0;i<t.length;i++){
+      var s=(t[i].textContent||'')+' '+(t[i].getAttribute('aria-label')||'')+' '+(t[i].getAttribute('data-e2e')||'');
+      if(rx.test(s))return t[i];
     }
+    var all=document.querySelectorAll('[data-e2e],[aria-label],[title],p,span,div,a,button');
+    for(var j=0;j<all.length;j++){
+      var x=all[j];
+      var own=(x.children.length===0?(x.textContent||''):'');
+      var s2=own+' '+(x.getAttribute('aria-label')||'')+' '+(x.getAttribute('title')||'')+' '+(x.getAttribute('data-e2e')||'');
+      if(s2.length<40&&rx.test(s2))return x;
+    }
+    return null;
   }
-  if(!tab){Android.onError('Не нашёл вкладку «Репосты». Проверьте, что вы вошли в аккаунт.');return;}
+  var tab=null;
+  for(var n=0;n<20&&!tab;n++){tab=find();if(!tab)await sleep(1000);}
+  if(!tab){
+    var info=tabs().map(function(e){return (e.textContent||'').trim()+'['+(e.getAttribute('data-e2e')||'')+']';}).join(' | ');
+    Android.onError('Не нашёл вкладку «Репосты».\nАдрес: '+location.href+'\nВкладки: '+(info||'нет')+'\nЗаголовок: '+document.title);
+    return;
+  }
   tab.click();
   await sleep(2500);
   var seen={},list=[],still=0,last=-1;
-  while(still<4){
+  while(still<6){
     var links=document.querySelectorAll('a[href*="/video/"]');
-    for(var j=0;j<links.length;j++){
-      var m=links[j].href.match(/\/video\/(\d+)/);
+    for(var k=0;k<links.length;k++){
+      var m=links[k].href.match(/\/video\/(\d+)/);
       if(!m||seen[m[1]])continue;
       seen[m[1]]=1;
-      var img=links[j].querySelector('img');
-      list.push({id:m[1],url:links[j].href,cover:img?img.src:''});
+      var img=links[k].querySelector('img');
+      list.push({id:m[1],url:links[k].href,cover:img?img.src:''});
     }
     Android.onProgress(list.length);
     still=(list.length===last)?still+1:0;
