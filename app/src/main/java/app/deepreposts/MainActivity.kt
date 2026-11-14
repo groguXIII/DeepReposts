@@ -106,6 +106,9 @@ class MainActivity : Activity() {
     private var running = false
     private var serviceOn = false
     private var tabSeen = false
+    private var loginPolls = 0
+    private var reloadedForUser = false
+    private var askedName = false
     private var user = ""
     private var qi = 0
     private var tries = 0
@@ -229,18 +232,39 @@ class MainActivity : Activity() {
         override fun run() {
             if (mode != Mode.LOGIN) return
             val cookies = CookieManager.getInstance().getCookie("https://www.tiktok.com") ?: ""
-            if (cookies.contains("sessionid=")) {
-                web.evaluateJavascript(Scripts.USER) { r ->
-                    val name = (r ?: "").trim('"')
-                    if (name.isNotEmpty() && name != "null" && mode == Mode.LOGIN) loggedIn(name)
-                    else ui.postDelayed(this, 2000)
+            if (!cookies.contains("sessionid=")) { loginPolls = 0; ui.postDelayed(this, 2000); return }
+            loginPolls++
+            if (loginPolls == 1) toast("Вход выполнен, определяю аккаунт…")
+            web.evaluateJavascript(Scripts.USER) { r ->
+                val name = (r ?: "").trim('"')
+                if (name.isNotEmpty() && name != "null" && mode == Mode.LOGIN) {
+                    loggedIn(name)
+                    return@evaluateJavascript
                 }
-            } else ui.postDelayed(this, 2000)
+                // после входа страница не перезагружается и «не знает» аккаунт — загружаем главную заново
+                if (loginPolls == 3 && !reloadedForUser) { reloadedForUser = true; web.loadUrl("https://www.tiktok.com/") }
+                // не получилось определить — просим ввести юзернейм вручную
+                if (loginPolls >= 15 && !askedName) { askedName = true; askUsername() }
+                ui.postDelayed(this, 2000)
+            }
         }
+    }
+
+    private fun askUsername() {
+        val et = android.widget.EditText(this).apply { hint = "например, maria_k"; setSingleLine(true) }
+        AlertDialog.Builder(this).setTitle("Введите ваш @юзернейм TikTok")
+            .setMessage("Не удалось определить аккаунт автоматически.")
+            .setView(et)
+            .setNegativeButton("Позже") { _, _ -> askedName = false; loginPolls = 5 }
+            .setPositiveButton("Готово") { _, _ ->
+                val n = et.text.toString().trim().removePrefix("@")
+                if (n.isNotEmpty() && mode == Mode.LOGIN) loggedIn(n) else { askedName = false; loginPolls = 5 }
+            }.show()
     }
 
     private fun showLogin() {
         setMode(Mode.LOGIN)
+        loginPolls = 0; reloadedForUser = false; askedName = false
         appLayer.visibility = View.GONE
         settingsView.visibility = View.GONE
         web.loadUrl("https://www.tiktok.com/login")
@@ -763,13 +787,26 @@ class MainActivity : Activity() {
 object Scripts {
     // имя пользователя вошедшего аккаунта
     const val USER = """(function(){
+  function fromHref(h){var m=(h||'').match(/\/@([^\/?#]+)/);return m?m[1]:'';}
   try{
     var d=JSON.parse(document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__').textContent);
     var u=d['__DEFAULT_SCOPE__']['webapp.app-context'].user;
     if(u&&u.uniqueId)return u.uniqueId;
   }catch(e){}
-  var a=document.querySelector('[data-e2e="nav-profile"]');
-  if(a){var m=(a.getAttribute('href')||'').match(/@([^\/?]+)/);if(m)return m[1];}
+  var sels=['[data-e2e="nav-profile"]','a[data-e2e*="profile"]','[data-e2e*="profile"] a'];
+  for(var i=0;i<sels.length;i++){
+    var a=document.querySelector(sels[i]);
+    if(a){var n=fromHref(a.getAttribute('href'));if(n)return n;}
+  }
+  if(window.__drU)return window.__drU;
+  if(window.__drU===undefined){
+    window.__drU='';
+    try{
+      fetch('/passport/web/account/info/?aid=1459',{credentials:'include'}).then(function(r){return r.json();}).then(function(j){
+        var x=(j&&j.data)||{};window.__drU=x.screen_name||x.username||x.unique_id||'';
+      }).catch(function(){});
+    }catch(e){}
+  }
   return '';
 })()"""
 
