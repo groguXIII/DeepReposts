@@ -145,14 +145,14 @@ class MainActivity : Activity() {
         appLayer.visibility = View.GONE
         root.addView(appLayer, FrameLayout.LayoutParams(MATCH, MATCH))
         loginBar = buildLoginBar()
-        root.addView(loginBar, FrameLayout.LayoutParams(MATCH, WRAP, Gravity.BOTTOM))
+        root.addView(loginBar, FrameLayout.LayoutParams(MATCH, dp(96), Gravity.BOTTOM))
         setContentView(root)
 
         askNotifications()
         user = prefs.getString("user", "") ?: ""
         val cached = prefs.getString("avatar", "") ?: ""
         if (cached.isNotEmpty()) showAvatar(cached)
-        if (user.isNotEmpty() && sessionOk()) { showApp(); startCollect() } else showLogin()
+        if (user.isNotEmpty()) { showApp(); startCollect() } else showLogin()
     }
 
     override fun onPause() { CookieManager.getInstance().flush(); super.onPause() }
@@ -215,7 +215,7 @@ class MainActivity : Activity() {
         web.destroy()
         web = makeWeb()
         root.addView(web, if (idx < 0) 0 else idx, FrameLayout.LayoutParams(MATCH, MATCH))
-        webMargin(if (mode == Mode.LOGIN) dp(60) else 0)
+        webMargin(if (mode == Mode.LOGIN) dp(96) else 0)
         web.settings.blockNetworkImage = mode == Mode.COLLECT || mode == Mode.DELETE
         when {
             running -> { armed = true; tries = 0; web.loadUrl(queue[qi].url) }
@@ -236,10 +236,23 @@ class MainActivity : Activity() {
     }
 
     // ---------- вход ----------
-    private fun sessionOk(): Boolean {
-        val c = CookieManager.getInstance().getCookie("https://www.tiktok.com") ?: return false
-        return c.contains("sessionid=") || c.contains("sid_tt=") || c.contains("sid_guard=")
+    private fun cookieString(): String {
+        val cm = CookieManager.getInstance()
+        val sb = StringBuilder()
+        for (u in listOf("https://www.tiktok.com", "https://tiktok.com", "https://m.tiktok.com", web.url ?: "")) {
+            if (u.startsWith("http")) sb.append(cm.getCookie(u) ?: "").append("; ")
+        }
+        return sb.toString()
     }
+
+    private fun sessionOk(): Boolean {
+        val c = cookieString()
+        return c.contains("sessionid=") || c.contains("sid_tt=") || c.contains("sid_guard=") || c.contains("uid_tt=")
+    }
+
+    // только ИМЕНА cookies (без значений) — для диагностики на экране входа
+    private fun cookieNames(): String =
+        cookieString().split(";").map { it.trim().substringBefore("=") }.filter { it.isNotEmpty() }.distinct().take(9).joinToString(", ").ifEmpty { "нет" }
 
     private fun webMargin(px: Int) {
         web.layoutParams = FrameLayout.LayoutParams(MATCH, MATCH).apply { bottomMargin = px }
@@ -248,38 +261,43 @@ class MainActivity : Activity() {
     private val poll = object : Runnable {
         override fun run() {
             if (mode != Mode.LOGIN) return
-            CookieManager.getInstance().flush()   // чтобы вход не терялся после закрытия приложения
-            if (!sessionOk()) {
-                loginPolls = 0
-                tvLoginInfo.text = "Войдите в TikTok на странице выше"
-                ui.postDelayed(this, 2000)
-                return
-            }
-            loginPolls++
-            tvLoginInfo.text = "Вход выполнен, определяю аккаунт… ($loginPolls)"
-            web.evaluateJavascript(Scripts.USER) { r ->
-                val name = (r ?: "").trim('"')
-                if (name.isNotEmpty() && name != "null" && mode == Mode.LOGIN) {
-                    loggedIn(name)
-                    return@evaluateJavascript
+            CookieManager.getInstance().flush()
+            val ok = sessionOk()
+            web.evaluateJavascript(Scripts.LOGIN_STATE) outer@{ st ->
+                if (mode != Mode.LOGIN) return@outer
+                val out = (st ?: "").contains("out")
+                tvLoginInfo.text = "Сессия: " + (if (ok) "есть" else "нет") + " · кнопка «Войти»: " + (if (out) "есть" else "нет") +
+                    "\nCookies: " + cookieNames() + "\n" + (web.url ?: "").removePrefix("https://").take(50)
+                if (!ok && out) { loginPolls = 0; ui.postDelayed(this, 2000); return@outer }
+                loginPolls++
+                web.evaluateJavascript(Scripts.USER) inner@{ r ->
+                    val name = (r ?: "").trim('"')
+                    if (name.isNotEmpty() && name != "null" && mode == Mode.LOGIN) {
+                        loggedIn(name)
+                        return@inner
+                    }
+                    // страница входа закрылась, а аккаунт не виден — открываем главную заново
+                    if (loginPolls == 8 && !reloadedForUser && !(web.url ?: "").contains("login")) {
+                        reloadedForUser = true
+                        web.loadUrl("https://www.tiktok.com/")
+                    }
+                    if (loginPolls >= 15 && !askedName) { askedName = true; askUsername() }
+                    ui.postDelayed(this, 2000)
                 }
-                // если страница входа уже закрылась, а аккаунт не виден — открываем главную заново
-                if (loginPolls == 8 && !reloadedForUser && !(web.url ?: "").contains("login")) {
-                    reloadedForUser = true
-                    web.loadUrl("https://www.tiktok.com/")
-                }
-                if (loginPolls >= 15 && !askedName) { askedName = true; askUsername() }
-                ui.postDelayed(this, 2000)
             }
         }
     }
 
     /** Кнопка «Я вошёл(а)»: не ждём автоопределения. */
     private fun manualLogin() {
-        if (!sessionOk()) { toast("Вход в TikTok ещё не выполнен. Войдите на странице выше."); return }
-        web.evaluateJavascript(Scripts.USER) { r ->
-            val name = (r ?: "").trim('"')
-            if (name.isNotEmpty() && name != "null") loggedIn(name) else askUsername()
+        val ok = sessionOk()
+        web.evaluateJavascript(Scripts.LOGIN_STATE) outer@{ st ->
+            val out = (st ?: "").contains("out")
+            if (!ok && out) { toast("TikTok ещё не завершил вход: на странице осталась кнопка «Войти»."); return@outer }
+            web.evaluateJavascript(Scripts.USER) inner@{ r ->
+                val name = (r ?: "").trim('"')
+                if (name.isNotEmpty() && name != "null") loggedIn(name) else askUsername()
+            }
         }
     }
 
@@ -288,7 +306,7 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(BG); setPadding(dp(12), dp(8), dp(12), dp(8))
         }
-        tvLoginInfo = TextView(this).apply { textSize = 12f; setTextColor(ICE); text = "Войдите в TikTok на странице выше" }
+        tvLoginInfo = TextView(this).apply { textSize = 11f; setTextColor(ICE); text = "Войдите в TikTok на странице выше" }
         lb.addView(tvLoginInfo, LinearLayout.LayoutParams(0, WRAP, 1f))
         lb.addView(button("Я вошёл(а)", true).apply { textSize = 14f; setOnClickListener { manualLogin() } },
             LinearLayout.LayoutParams(WRAP, dp(44)).apply { leftMargin = dp(8) })
@@ -313,7 +331,8 @@ class MainActivity : Activity() {
         appLayer.visibility = View.GONE
         settingsView.visibility = View.GONE
         loginBar.visibility = View.VISIBLE
-        webMargin(dp(60))
+        webMargin(dp(96))
+        note("Вход в TikTok…")
         web.loadUrl("https://www.tiktok.com/login")
         ui.removeCallbacks(poll); ui.postDelayed(poll, 2000)
     }
@@ -466,6 +485,11 @@ class MainActivity : Activity() {
         val more = if (o.isNull("more")) null else o.optBoolean("more")
         when {
             tab && (more == false || items.size >= LOAD_LIMIT) -> finishCollect()
+            !tab && o.optInt("tries") >= 12 && o.optBoolean("lo") && !sessionOk() -> {
+                prefs.edit().remove("user").apply()
+                toast("Сессия TikTok не найдена — войдите снова")
+                showLogin()
+            }
             !tab && o.optInt("tries") >= 30 -> failCollect(
                 "Не нашёл вкладку «Репосты».\nАдрес: " + o.optString("url") + "\nВкладки: " + o.optString("info") + "\nЗаголовок: " + o.optString("title"))
             tab && now - lastGrowth > 30000 ->
@@ -860,6 +884,17 @@ object Scripts {
   return '';
 })()"""
 
+    // Есть ли на странице кнопка «Войти» (значит, в аккаунт не вошли)
+    const val LOGIN_STATE = """(function(){
+  if(document.querySelector('[data-e2e="top-login-button"],#header-login-button,[data-e2e="nav-login-button"],[data-e2e="login-button"]'))return 'out';
+  var els=document.querySelectorAll('button,a');
+  for(var i=0;i<els.length;i++){
+    var t=(els[i].textContent||'').trim(),a=(els[i].getAttribute('aria-label')||'').trim();
+    if(t==='Log in'||t==='Войти'||(a.length<20&&/^(log in|войти)$/i.test(a)))return 'out';
+  }
+  return 'in';
+})()"""
+
     // Один раз на странице профиля: «подслушивает» ответы, которыми сам TikTok отдаёт список репостов
     // (id, обложка, автор) — так не нужно листать страницу и читать картинки с экрана.
     const val INIT = """(function(){
@@ -963,10 +998,19 @@ object Scripts {
       window.scrollTo(0,document.documentElement.scrollHeight);
     }
   }
+  function loginVisible(){
+    if(document.querySelector('[data-e2e="top-login-button"],#header-login-button,[data-e2e="nav-login-button"],[data-e2e="login-button"]'))return true;
+    var els=document.querySelectorAll('button,a');
+    for(var i=0;i<els.length;i++){
+      var t=(els[i].textContent||'').trim(),a=(els[i].getAttribute('aria-label')||'').trim();
+      if(t==='Log in'||t==='Войти'||(a.length<20&&/^(log in|войти)$/i.test(a)))return true;
+    }
+    return false;
+  }
   var out=S.q.splice(0,S.q.length);
   var info='';
   if(!S.tab&&S.tabTry>=25)info=tabs().map(function(e){return (e.textContent||'').trim()+'['+(e.getAttribute('data-e2e')||'')+']';}).join(' | ')||'нет';
-  return {n:S.n,api:S.api,more:S.more,tab:S.tab,tries:S.tabTry,fails:S.fails,items:out,url:location.href,av:S.av,info:info,title:document.title};
+  return {n:S.n,api:S.api,more:S.more,tab:S.tab,tries:S.tabTry,fails:S.fails,items:out,url:location.href,av:S.av,info:info,title:document.title,lo:(!S.tab&&S.tabTry>=12)?loginVisible():false};
 })()"""
 
     // На странице видео: нажимает «Удалить репост» (сразу или через меню «Поделиться»)
