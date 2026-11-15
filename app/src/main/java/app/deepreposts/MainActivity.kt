@@ -4,6 +4,8 @@ import android.Manifest
 import android.app.Activity
 import android.app.AlertDialog
 import android.app.NotificationManager
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
@@ -34,6 +36,7 @@ import android.widget.FrameLayout
 import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
 import androidx.core.content.FileProvider
@@ -66,6 +69,7 @@ class Item(val url: String, val id: String, val cover: String)
 /** Квадратная плитка: превью + кружок-галочка. */
 class Cell(c: Context) : FrameLayout(c) {
     val img = ImageView(c).apply { scaleType = ImageView.ScaleType.CENTER_CROP; setBackgroundColor(PANEL) }
+    val scrim = View(c).apply { setBackgroundColor(0x99000000.toInt()); visibility = View.GONE }
     val badge = TextView(c).apply { gravity = Gravity.CENTER; textSize = 14f }
 
     init {
@@ -74,6 +78,7 @@ class Cell(c: Context) : FrameLayout(c) {
         setPadding(pad, pad, pad, pad)
         val b = (26 * d).toInt()
         addView(img, FrameLayout.LayoutParams(MATCH, MATCH))
+        addView(scrim, FrameLayout.LayoutParams(MATCH, MATCH))
         addView(badge, FrameLayout.LayoutParams(b, b, Gravity.END or Gravity.TOP).apply { setMargins(b / 4, b / 4, b / 4, b / 4) })
     }
 
@@ -101,6 +106,7 @@ class MainActivity : Activity() {
     private lateinit var bar: ProgressBar
     private lateinit var btnDelete: Button
     private lateinit var loginBar: LinearLayout
+    private lateinit var btnSpeed: Button
     private lateinit var tvLoginInfo: TextView
 
     private var mode = Mode.LOGIN
@@ -109,6 +115,23 @@ class MainActivity : Activity() {
     private var serviceOn = false
     private var tabSeen = false
     private var loginPolls = 0
+    private val logLines = ArrayList<String>()
+    private var fastMode = false
+    private var tpl: JSONObject? = null
+    private var fastIdx = 0
+    private var recv = 0
+    private var sentCnt = 0
+    private var okCount = 0
+    private var failCount = 0
+    private var errRun = 0
+    private var pauses = 0
+    private var delayMul = 1.0
+    private var pauseUntil = 0L
+    private var delPending = 0
+    private var lastFlush = 0L
+    private var lastSendAt = 0L
+    private var lastLogged = 0L
+    private var diagCount = 0
     private var reloadedForUser = false
     private var askedName = false
     private var user = ""
@@ -369,8 +392,46 @@ class MainActivity : Activity() {
     // ---------- состояние ----------
     private fun deleted(): Int {
         if (System.currentTimeMillis() - prefs.getLong("last", 0) >= DAY_MS) prefs.edit().putInt("deleted", 0).apply()
-        return prefs.getInt("deleted", 0)
+        return prefs.getInt("deleted", 0) + delPending
     }
+
+    private fun bump(n: Int) {
+        delPending += n
+        if (System.currentTimeMillis() - lastFlush > 700) flushDeleted()
+    }
+
+    private fun flushDeleted() {
+        if (delPending == 0) return
+        val base = if (System.currentTimeMillis() - prefs.getLong("last", 0) >= DAY_MS) 0 else prefs.getInt("deleted", 0)
+        prefs.edit().putInt("deleted", base + delPending).putLong("last", System.currentTimeMillis()).apply()
+        delPending = 0; lastFlush = System.currentTimeMillis()
+    }
+
+    // ---------- журнал отладки и скорость ----------
+    private fun dlog(s: String) {
+        val t = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+        logLines.add("$t $s")
+        if (logLines.size > 500) logLines.removeAt(0)
+    }
+
+    private fun showLog() {
+        val body = if (logLines.isEmpty()) "Журнал пока пуст" else logLines.joinToString("\n")
+        val tv = TextView(this).apply {
+            text = body; textSize = 10f; setTextColor(Color.WHITE); typeface = Typeface.MONOSPACE
+            setPadding(dp(12), dp(8), dp(12), dp(8)); setTextIsSelectable(true)
+        }
+        val sv = ScrollView(this).apply { addView(tv) }
+        AlertDialog.Builder(this).setTitle("Журнал отладки").setView(sv)
+            .setPositiveButton("Копировать") { _, _ ->
+                getSystemService(ClipboardManager::class.java).setPrimaryClip(ClipData.newPlainText("DeepReposts", body))
+                toast("Скопировано — вставьте в чат")
+            }
+            .setNegativeButton("Закрыть", null).show()
+    }
+
+    private fun speedName(i: Int) = when (i) { 0 -> "максимальная, 24–48 мс"; 1 -> "быстрая, 0,1–0,3 с"; else -> "осторожная, 0,5–1,5 с" }
+    private fun speedMin(): Long = when (prefs.getInt("speed", 0)) { 0 -> 24L; 1 -> 100L; else -> 500L }
+    private fun speedMax(): Long = when (prefs.getInt("speed", 0)) { 0 -> 48L; 1 -> 300L; else -> 1500L }
 
     private fun resetText(): String {
         if (deleted() == 0) return "Лимит свободен"
@@ -483,8 +544,14 @@ class MainActivity : Activity() {
         if (av.isNotEmpty() && av != (prefs.getString("avatar", "") ?: "")) { prefs.edit().putString("avatar", av).apply(); showAvatar(av) }
         refreshStats()
         val more = if (o.isNull("more")) null else o.optBoolean("more")
+        val idle = now - lastGrowth
+        if (added == 0 && idle > 6000 && now - lastLogged > 6000) {
+            lastLogged = now
+            dlog("загрузка: n=" + items.size + " api=" + o.optInt("api") + " ошибок=" + o.optInt("fails") + " hasMore=" + more +
+                " tab=" + tab + " http=" + o.optInt("st") + " ответ=" + o.optString("le"))
+        }
         when {
-            tab && (more == false || items.size >= LOAD_LIMIT) -> finishCollect()
+            tab && ((more == false && idle > 10000) || items.size >= LOAD_LIMIT) -> finishCollect()
             !tab && o.optInt("tries") >= 12 && o.optBoolean("lo") && !sessionOk() -> {
                 prefs.edit().remove("user").apply()
                 toast("Сессия TikTok не найдена — войдите снова")
@@ -492,9 +559,9 @@ class MainActivity : Activity() {
             }
             !tab && o.optInt("tries") >= 30 -> failCollect(
                 "Не нашёл вкладку «Репосты».\nАдрес: " + o.optString("url") + "\nВкладки: " + o.optString("info") + "\nЗаголовок: " + o.optString("title"))
-            tab && now - lastGrowth > 30000 ->
+            tab && idle > 25000 ->
                 if (items.isNotEmpty()) finishCollect()
-                else failCollect("Репосты не загрузились.\nОтветов TikTok: " + o.optInt("api") + ", ошибок: " + o.optInt("fails") + "\nАдрес: " + o.optString("url"))
+                else failCollect("Репосты не загрузились.\nОтветов TikTok: " + o.optInt("api") + ", ошибок: " + o.optInt("fails") + "\n" + o.optString("le"))
             else -> {
                 tvStatus.text = if (tab) "Загружено репостов: ${items.size}" else "Ищу вкладку «Репосты»…"
                 note("Загрузка репостов: ${items.size}")
@@ -504,6 +571,7 @@ class MainActivity : Activity() {
     }
 
     private fun finishCollect() {
+        dlog("загрузка завершена: ${items.size} репостов")
         setMode(Mode.IDLE); noteStop(); refreshStats()
         tvStatus.text = "Загружено репостов: ${items.size}. " + resetText()
     }
@@ -516,7 +584,7 @@ class MainActivity : Activity() {
     // ---------- удаление ----------
     private fun onDeleteClick() {
         if (running) { stopRun("Остановлено"); return }
-        if (mode == Mode.COLLECT) { toast("Репосты ещё загружаются"); return }
+        if (mode == Mode.COLLECT) { toast("Репосты ещё загружаются. В настройках можно начать загрузку заново."); return }
         val left = LIMIT - deleted()
         val todo = items.filter { it.id in unchecked }
         if (left <= 0) { toast(resetText()); return }
@@ -531,62 +599,188 @@ class MainActivity : Activity() {
 
     private fun startDelete(list: List<Item>) {
         queue = list; qi = 0; fails = 0; running = true
+        fastMode = false; tpl = null; fastIdx = 0; recv = 0; sentCnt = 0; okCount = 0; failCount = 0
+        errRun = 0; pauses = 0; delayMul = 6.0; pauseUntil = 0L; diagCount = 0   // стартуем помедленнее и разгоняемся, пока TikTok отвечает без ошибок
         setMode(Mode.DELETE)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         refreshStats()
+        dlog("удаление: " + list.size + " шт., скорость " + speedName(prefs.getInt("speed", 0)))
         note("Удаление: 0 из ${list.size}")
         nextVideo()
     }
 
+    // --- первый репост удаляем «как человек» (через страницу видео) и подсматриваем, какой запрос шлёт сайт
     private fun nextVideo() {
-        if (!running) return
-        if (qi >= queue.size) { stopRun("Готово"); return }
+        if (!running || fastMode) return
+        if (qi >= queue.size) { stopRun("Готово: удалено $okCount"); return }
         armed = true; tries = 0
         tvStatus.text = "Удаляю ${qi + 1} из ${queue.size}"
         note("Удаление: ${qi + 1} из ${queue.size}")
+        dlog("страница: " + queue[qi].url)
         web.loadUrl(queue[qi].url)
         val mine = qi
-        ui.postDelayed({ if (running && qi == mine && armed) { armed = false; onDeleted(false) } }, 30000)   // страница так и не загрузилась
+        ui.postDelayed({ if (running && !fastMode && qi == mine && armed) { armed = false; domFail() } }, 30000)
     }
 
     private fun removeTick() {
-        if (!running) return
+        if (!running || fastMode) return
         val mine = qi
         web.evaluateJavascript(Scripts.REMOVE) { r ->
-            if (!running || qi != mine) return@evaluateJavascript
-            if ((r ?: "").contains("done")) onDeleted(true)
-            else {
-                tries++
-                if (tries >= 14) onDeleted(false) else ui.postDelayed({ removeTick() }, 700)
+            if (!running || fastMode || qi != mine) return@evaluateJavascript
+            val res = (r ?: "").trim('"')
+            when {
+                res.startsWith("done") -> onDomDone()
+                res.startsWith("skip") -> { dlog("уже не репост: $res"); onDeleted(true) }
+                res.startsWith("timeout") -> { dlog("кнопка нажата, но сайт не подтвердил: $res"); domFail() }
+                else -> {
+                    tries++
+                    if (tries >= 14) domFail() else ui.postDelayed({ removeTick() }, 700)
+                }
             }
         }
     }
 
+    private fun domFail() {
+        if (!running || fastMode) return
+        dlog("не удалось удалить: " + queue[qi].url)
+        if (diagCount < 3) {
+            diagCount++
+            web.evaluateJavascript(Scripts.DIAG) { r ->
+                dlog("DIAG " + (r ?: "").take(1800))
+                onDeleted(false)
+            }
+        } else onDeleted(false)
+    }
+
     private fun onDeleted(ok: Boolean) {
-        if (!running) return
-        if (ok) {
-            fails = 0
-            val x = queue[qi]
-            val idx = items.indexOf(x)
-            if (idx >= 0) { items.removeAt(idx); gridAdapter.notifyItemRemoved(idx + 1) }
-            unchecked.remove(x.id)
-            prefs.edit().putInt("deleted", deleted() + 1).putLong("last", System.currentTimeMillis()).apply()
-            if (qi % 20 == 0) saveUnchecked()
-        } else if (++fails >= 5) {
-            stopRun("5 ошибок подряд: TikTok изменил страницу или не принимает запросы")
-            return
+        if (!running || fastMode) return
+        if (ok) { markDeleted(queue[qi]); okCount++; fails = 0 }
+        else {
+            failCount++
+            if (++fails >= 3) {
+                stopRun("3 ошибки подряд: не удалось нажать «Удалить репост». Откройте Настройки → Журнал отладки, скопируйте и пришлите разработчику.")
+                return
+            }
         }
         qi++
         refreshStats()
-        ui.postDelayed({ nextVideo() }, Random.nextLong(1200, 2500))   // небольшая пауза между удалениями
+        ui.postDelayed({ nextVideo() }, Random.nextLong(600, 1500))
+    }
+
+    private fun onDomDone() {
+        val x = queue[qi]
+        web.evaluateJavascript(Scripts.TPL) { r ->
+            if (!running) return@evaluateJavascript
+            val o = try { JSONObject(r ?: "") } catch (e: Exception) { null }
+            markDeleted(x); okCount++; fails = 0; qi++
+            refreshStats()
+            if (o != null && o.optBoolean("hasId") && queue.size - qi > 2) {
+                tpl = o
+                dlog("шаблон запроса: " + o.optString("m") + " " + o.optString("u").substringBefore("?") +
+                    " тело=" + o.optString("b").take(60) + " тип=" + o.optString("ct"))
+                startFast()
+            } else {
+                dlog("шаблон запроса не пойман (" + (o?.toString()?.take(200) ?: "нет") + ") — продолжаю медленно, через страницы")
+                ui.postDelayed({ nextVideo() }, 800)
+            }
+        }
+    }
+
+    // --- быстрый режим: те же запросы, что шлёт сайт, но без загрузки страниц; скорость подстраивается под ответы TikTok
+    private fun startFast() {
+        val t = tpl ?: return
+        web.evaluateJavascript(Scripts.FAST_INIT) { r ->
+            if (!running) return@evaluateJavascript
+            val res = r ?: ""
+            if (res.contains("ok") || res.contains("ready")) {
+                fastMode = true; fastIdx = qi; lastSendAt = System.currentTimeMillis()
+                dlog("быстрый режим: осталось ${queue.size - qi}; " + t.optString("m"))
+                note("Быстрое удаление…")
+                fastSend(); fastPoll()
+            } else {
+                dlog("быстрый режим недоступен: $res")
+                ui.postDelayed({ nextVideo() }, 800)
+            }
+        }
+    }
+
+    private fun fastSend() {
+        if (!running || !fastMode || fastIdx >= queue.size) return
+        val now = System.currentTimeMillis()
+        if (now < pauseUntil) {
+            tvStatus.text = "TikTok ограничил запросы — пауза ${(pauseUntil - now) / 1000} с"
+            ui.postDelayed({ fastSend() }, 500); return
+        }
+        if (sentCnt - recv >= 12) { ui.postDelayed({ fastSend() }, 25); return }
+        val x = queue[fastIdx]
+        fastIdx++
+        if (x.id.isNotEmpty() && x.id.all { it.isDigit() }) {
+            sentCnt++; lastSendAt = now
+            web.evaluateJavascript("window.__drFast('" + x.id + "')", null)
+        } else { failCount++; recv++ }
+        val d = (Random.nextLong(speedMin(), speedMax() + 1) * delayMul).toLong().coerceIn(speedMin(), 10000L)
+        ui.postDelayed({ fastSend() }, d)
+    }
+
+    private fun fastPoll() {
+        if (!running || !fastMode) return
+        web.evaluateJavascript(Scripts.FAST_POLL) { r ->
+            if (!running || !fastMode) return@evaluateJavascript
+            val o = try { JSONObject(r ?: "") } catch (e: Exception) { null }
+            if (o != null && !o.has("err")) {
+                val arr = o.getJSONArray("res")
+                val gone = HashSet<String>()
+                var errs = 0
+                for (i in 0 until arr.length()) {
+                    val x = arr.getJSONObject(i)
+                    recv++
+                    if (x.optInt("ok") == 1) { gone.add(x.getString("id")); okCount++; errRun = 0 } else { failCount++; errs++; errRun++ }
+                }
+                if (gone.isNotEmpty()) {
+                    items.removeAll { it.id in gone }
+                    for (id in gone) unchecked.remove(id)
+                    gridAdapter.notifyDataSetChanged()
+                    bump(gone.size)
+                }
+                if (errs > 0) {
+                    dlog("ошибки: +$errs (подряд $errRun) " + o.optString("last"))
+                    delayMul = minOf(delayMul * 1.7, 200.0)
+                    if (errRun >= 8) {
+                        pauses++; errRun = 0
+                        pauseUntil = System.currentTimeMillis() + 60000
+                        dlog("пауза 60 с (#$pauses)")
+                        if (pauses >= 3) {
+                            stopRun("TikTok ограничивает действия аккаунта. Подождите около часа и повторите. Удалено: $okCount")
+                            return@evaluateJavascript
+                        }
+                    }
+                } else if (arr.length() > 0) {
+                    delayMul = maxOf(1.0, delayMul * 0.97)
+                }
+                refreshStats()
+                if (System.currentTimeMillis() >= pauseUntil) tvStatus.text = "Удалено $okCount из ${queue.size}" + (if (failCount > 0) ", ошибок $failCount" else "")
+                note("Удалено $okCount из ${queue.size}")
+            }
+            val stuck = fastIdx >= queue.size && System.currentTimeMillis() - lastSendAt > 20000
+            if (recv >= queue.size || stuck) stopRun("Готово: удалено $okCount" + (if (failCount > 0) ", не удалось $failCount" else ""))
+            else ui.postDelayed({ fastPoll() }, 120)
+        }
+    }
+
+    private fun markDeleted(x: Item) {
+        val idx = items.indexOf(x)
+        if (idx >= 0) { items.removeAt(idx); gridAdapter.notifyItemRemoved(idx + 1) }
+        unchecked.remove(x.id)
+        bump(1)
     }
 
     private fun stopRun(msg: String) {
-        running = false; armed = false
+        running = false; armed = false; fastMode = false
         setMode(Mode.IDLE)
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        saveUnchecked(); noteStop(); refresh()
+        flushDeleted(); saveUnchecked(); noteStop(); refresh()
         tvStatus.text = msg
+        dlog("итог: $msg")
     }
 
     private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
@@ -729,9 +923,7 @@ class MainActivity : Activity() {
         tvUser = TextView(this).apply { textSize = 17f; setTypeface(null, Typeface.BOLD); setTextColor(GOLD); gravity = Gravity.CENTER }
         header.addView(tvUser, lp(12))
 
-        header.addView(SceneView(this), LinearLayout.LayoutParams(MATCH, WRAP).apply {
-            leftMargin = -dp(16); rightMargin = -dp(16); topMargin = dp(4)
-        })
+        header.addView(View(this), LinearLayout.LayoutParams(MATCH, dp(170)).apply { topMargin = dp(4) })   // тут виден фон с деревней
 
         val panel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -799,13 +991,22 @@ class MainActivity : Activity() {
         tvUpd = TextView(this).apply { textSize = 13f; setTextColor(ICE) }
         col.addView(tvUpd, lp(8))
 
-        col.addView(button("Работа в фоне: снять ограничения батареи", false).apply { setOnClickListener { askBatteryExemption() } }, lp(16, dp(48)))
+        btnSpeed = button("Скорость удаления: " + speedName(prefs.getInt("speed", 0)), false).apply {
+            setOnClickListener {
+                val next = (prefs.getInt("speed", 0) + 1) % 3
+                prefs.edit().putInt("speed", next).apply()
+                text = "Скорость удаления: " + speedName(next)
+            }
+        }
+        col.addView(btnSpeed, lp(16, dp(48)))
+        col.addView(button("Работа в фоне: снять ограничения батареи", false).apply { setOnClickListener { askBatteryExemption() } }, lp(8, dp(48)))
         col.addView(button("Обновить список репостов", false).apply {
             setOnClickListener {
-                if (running || mode == Mode.COLLECT) toast("Приложение сейчас занято")
+                if (running) toast("Сначала остановите удаление")
                 else { closeSettings(); startCollect() }
             }
         }, lp(8, dp(48)))
+        col.addView(button("Журнал отладки", false).apply { setOnClickListener { showLog() } }, lp(8, dp(48)))
         col.addView(button("Выйти из аккаунта TikTok", false).apply { setOnClickListener { logout() } }, lp(8, dp(48)))
         return col
     }
@@ -844,7 +1045,7 @@ class MainActivity : Activity() {
                 shape = GradientDrawable.OVAL
                 if (on) setColor(GOLD) else { setColor(0x66000000); setStroke(3, Color.WHITE) }
             }
-            cell.img.alpha = if (on) 1f else 0.5f   // без галочки = будет удалён
+            cell.scrim.visibility = if (on) View.GONE else View.VISIBLE   // затемнено = без галочки = будет удалён
             if (cell.img.tag != item.cover) {
                 cell.img.tag = item.cover
                 cell.img.setImageDrawable(null)
@@ -890,7 +1091,7 @@ object Scripts {
   var els=document.querySelectorAll('button,a');
   for(var i=0;i<els.length;i++){
     var t=(els[i].textContent||'').trim(),a=(els[i].getAttribute('aria-label')||'').trim();
-    if(t==='Log in'||t==='Войти'||(a.length<20&&/^(log in|войти)$/i.test(a)))return 'out';
+    if(t==='Log in'||t==='Войти'||(a.length<20&&(a.toLowerCase()==='log in'||a.toLowerCase()==='войти')))return 'out';
   }
   return 'in';
 })()"""
@@ -899,7 +1100,7 @@ object Scripts {
     // (id, обложка, автор) — так не нужно листать страницу и читать картинки с экрана.
     const val INIT = """(function(){
   if(window.__dr)return 'already';
-  var S=window.__dr={m:{},q:[],n:0,api:0,more:null,cursor:null,tpl:null,busy:false,busyAt:0,fails:0,tab:0,tabTry:0,tabAt:0,av:''};
+  var S=window.__dr={m:{},q:[],n:0,api:0,more:null,cursor:null,tpl:null,busy:false,busyAt:0,fails:0,tab:0,tabTry:0,tabAt:0,av:'',variant:0,stall:0,le:'',st:0,sc:0};
   var LIM=50000;
   function add(it){
     try{
@@ -940,7 +1141,7 @@ object Scripts {
 })()"""
 
     // Короткий шаг, который приложение вызывает несколько раз в секунду: находит вкладку «Репосты»,
-    // просит у TikTok следующие страницы списка, отдаёт приложению новые репосты.
+    // просит у TikTok следующие страницы списка, подталкивает прокрутку, отдаёт приложению новые репосты.
     const val STEP = """(function(){
   var S=window.__dr;if(!S)return {err:'noinit'};
   var LIM=50000;
@@ -975,13 +1176,21 @@ object Scripts {
   }
   function page(){
     S.busy=true;S.busyAt=Date.now();
+    var before=S.n;
     var u=new URL(S.tpl);
     u.searchParams.set('cursor',S.cursor==null?'0':String(S.cursor));
-    u.searchParams.delete('X-Bogus');u.searchParams.delete('_signature');
-    fetch(u.toString(),{credentials:'include'}).then(function(r){return r.json();}).then(function(d){
-      if(!d||!d.itemList)S.fails++;else S.fails=0;
+    if(!S.variant){u.searchParams.delete('X-Bogus');u.searchParams.delete('_signature');}
+    fetch(u.toString(),{credentials:'include'}).then(function(r){S.st=r.status;return r.text();}).then(function(tx){
+      var d=null;try{d=JSON.parse(tx);}catch(e){}
+      if(d&&d.itemList){
+        S.fails=0;
+        if(S.n===before)S.stall++;else S.stall=0;
+        if(S.stall>=3)S.fails=3;
+      }else{
+        S.fails++;S.variant=S.variant?0:1;S.le=S.st+': '+String(tx).slice(0,140);
+      }
       S.busy=false;
-    }).catch(function(){S.fails++;S.busy=false;});
+    }).catch(function(e){S.fails++;S.le='net: '+e;S.busy=false;});
   }
   if(!S.av){
     var av=document.querySelector('[data-e2e="user-avatar"] img')||document.querySelector('[data-e2e="user-avatar"]');
@@ -991,58 +1200,165 @@ object Scripts {
     var t=findTab();
     if(t){t.click();S.tab=1;S.tabAt=Date.now();}else S.tabTry++;
   }else{
-    if(S.busy&&Date.now()-S.busyAt>15000){S.busy=false;S.fails++;}
+    if(S.busy&&Date.now()-S.busyAt>15000){S.busy=false;S.fails++;S.le='timeout';}
     if(S.tpl&&S.more!==false&&!S.busy&&S.fails<3&&S.n<LIM)page();
-    if((S.api===0&&Date.now()-S.tabAt>12000)||S.fails>=3){
-      scrape();
-      window.scrollTo(0,document.documentElement.scrollHeight);
-    }
+    if((S.api===0&&Date.now()-S.tabAt>12000)||S.fails>=3)scrape();
+    if(Date.now()-S.sc>1500){S.sc=Date.now();window.scrollTo(0,document.documentElement.scrollHeight);}
   }
   function loginVisible(){
     if(document.querySelector('[data-e2e="top-login-button"],#header-login-button,[data-e2e="nav-login-button"],[data-e2e="login-button"]'))return true;
     var els=document.querySelectorAll('button,a');
     for(var i=0;i<els.length;i++){
       var t=(els[i].textContent||'').trim(),a=(els[i].getAttribute('aria-label')||'').trim();
-      if(t==='Log in'||t==='Войти'||(a.length<20&&/^(log in|войти)$/i.test(a)))return true;
+      if(t==='Log in'||t==='Войти'||(a.length<20&&(a.toLowerCase()==='log in'||a.toLowerCase()==='войти')))return true;
     }
     return false;
   }
   var out=S.q.splice(0,S.q.length);
   var info='';
   if(!S.tab&&S.tabTry>=25)info=tabs().map(function(e){return (e.textContent||'').trim()+'['+(e.getAttribute('data-e2e')||'')+']';}).join(' | ')||'нет';
-  return {n:S.n,api:S.api,more:S.more,tab:S.tab,tries:S.tabTry,fails:S.fails,items:out,url:location.href,av:S.av,info:info,title:document.title,lo:(!S.tab&&S.tabTry>=12)?loginVisible():false};
+  return {n:S.n,api:S.api,more:S.more,tab:S.tab,tries:S.tabTry,fails:S.fails,items:out,url:location.href,av:S.av,info:info,title:document.title,
+    le:S.le,st:S.st,lo:(!S.tab&&S.tabTry>=12)?loginVisible():false};
 })()"""
 
-    // На странице видео: нажимает «Удалить репост» (сразу или через меню «Поделиться»)
-    // и возвращает 'done', только когда эта кнопка действительно пропала.
+    // Страница видео: подсматривает запросы сайта, нажимает кнопку репоста ОДИН раз и ждёт, пока сайт
+    // подтвердит удаление ответом status_code = 0. Возвращает 'wait' | 'done' | 'skip:…' | 'timeout:…'
     const val REMOVE = """(function(){
-  var R=window.__drR||(window.__drR={clicked:0,shared:0});
-  var re=/remove repost|undo repost|удалить репост|убрать репост|отменить репост/i;
-  function find(){
-    var els=document.querySelectorAll('button,[role="button"],[role="menuitem"],[aria-label],[data-e2e]');
-    for(var i=0;i<els.length;i++){
-      var t=(els[i].getAttribute('aria-label')||'')+' '+(els[i].textContent||'');
-      if(t.length<80&&re.test(t))return els[i];
+  var vm=location.pathname.match(/\/video\/(\d+)/);
+  var D=window.__drD;
+  if(!D){
+    D=window.__drD={vid:vm?vm[1]:'',clicked:0,shared:0,net:[],ok:0,tpl:null,desc:'',at:0,ticks:0,confirmed:0};
+    var ctype=function(h){try{if(!h)return '';if(typeof h.get==='function')return h.get('content-type')||'';return h['Content-Type']||h['content-type']||'';}catch(e){return '';}};
+    var bodyOf=function(b){try{if(typeof b==='string')return b;if(b&&typeof b.toString==='function'&&b instanceof URLSearchParams)return b.toString();}catch(e){}return '';};
+    var judge=function(rec){
+      if(rec.m==='GET'||!D.clicked)return;
+      var path=rec.u.split('?')[0];
+      var sure=/repost/i.test(path),maybe=/\/api\/(commit|item)\//i.test(path);
+      if(rec.c===0&&(sure||maybe)){
+        D.ok=1;
+        D.tpl={u:rec.u,m:rec.m,b:rec.b,ct:rec.ct,hasId:!!(D.vid&&(rec.u.indexOf(D.vid)>-1||(rec.b||'').indexOf(D.vid)>-1))};
+      }
+    };
+    var of=window.fetch;
+    window.fetch=function(input,init){
+      var u=(typeof input==='string')?input:((input&&input.url)||'');
+      var m=String((init&&init.method)||(input&&input.method)||'GET').toUpperCase();
+      var p=of.apply(this,arguments);
+      if(m!=='GET'&&u.indexOf('/api/')>-1){
+        var rec={u:u,m:m,b:bodyOf(init&&init.body),ct:ctype(init&&init.headers),s:0,c:null};
+        D.net.push(rec);if(D.net.length>40)D.net.shift();
+        p.then(function(r){rec.s=r.status;return r.clone().text();}).then(function(t){
+          try{var j=JSON.parse(t);rec.c=(j.status_code!==undefined)?j.status_code:((j.statusCode!==undefined)?j.statusCode:null);}catch(e){rec.c='x';}
+          judge(rec);
+        }).catch(function(){});
+      }
+      return p;
+    };
+    var xo=XMLHttpRequest.prototype.open,xs=XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open=function(m,u){this.__m=String(m).toUpperCase();this.__u=String(u);return xo.apply(this,arguments);};
+    XMLHttpRequest.prototype.send=function(b){
+      var x=this;
+      if(x.__m&&x.__m!=='GET'&&x.__u.indexOf('/api/')>-1){
+        var rec={u:x.__u,m:x.__m,b:bodyOf(b),ct:'',s:0,c:null};
+        D.net.push(rec);if(D.net.length>40)D.net.shift();
+        x.addEventListener('load',function(){
+          rec.s=x.status;
+          try{var j=JSON.parse(x.responseText);rec.c=(j.status_code!==undefined)?j.status_code:((j.statusCode!==undefined)?j.statusCode:null);}catch(e){rec.c='x';}
+          judge(rec);
+        });
+      }
+      return xs.apply(this,arguments);
+    };
+  }
+  D.ticks++;
+  if(D.ok)return 'done';
+  function btnOf(e){return (e.closest&&e.closest('button,[role="button"]'))||e;}
+  function desc(e){return e.tagName+'['+(e.getAttribute('data-e2e')||'')+'|'+(e.getAttribute('aria-label')||'').slice(0,30)+'|'+(e.getAttribute('aria-pressed')||'')+']';}
+  function findDirect(){
+    var q=document.querySelectorAll('[data-e2e*="repost" i],[aria-label*="repost" i],[aria-label*="репост" i]');
+    for(var i=0;i<q.length;i++){
+      if(q[i].getAttribute('data-e2e')==='repost-tab')continue;
+      return btnOf(q[i]);
     }
     return null;
   }
-  var b=find();
-  if(R.clicked){
-    if(!b)return 'done';
-    var d=document.querySelector('[role="dialog"]');
-    if(d){
-      var bs=d.querySelectorAll('button');
+  function findMenuItem(){
+    var els=document.querySelectorAll('button,[role="button"],[role="menuitem"],li,div,span');
+    for(var i=0;i<els.length;i++){
+      var t=(els[i].textContent||'').trim();
+      if(t.length<30&&['remove repost','undo repost','repost','удалить репост','убрать репост','репост'].indexOf(t.toLowerCase())>-1)return btnOf(els[i]);
+    }
+    return null;
+  }
+  if(D.clicked){
+    var dg=document.querySelector('[role="dialog"]');
+    if(dg&&!D.confirmed){
+      var bs=dg.querySelectorAll('button');
       for(var j=0;j<bs.length;j++){
-        if(/remove|delete|confirm|удалить|убрать|подтвердить/i.test(bs[j].textContent||'')){bs[j].click();break;}
+        if(/remove|delete|confirm|yes|удалить|убрать|подтвердить|да/i.test(bs[j].textContent||'')){bs[j].click();D.confirmed=1;break;}
       }
     }
+    if(Date.now()-D.at>4500)return 'timeout:'+D.desc;
     return 'wait';
   }
-  if(b){b.click();R.clicked=1;return 'wait';}
-  if(!R.shared){
-    var s=document.querySelector('[data-e2e="share-icon"],[data-e2e="undefined-icon"]');
-    if(s){s.click();R.shared=1;}
+  var e=findDirect();
+  if(e){
+    if(e.getAttribute('aria-pressed')==='false')return 'skip:'+desc(e);
+    D.desc=desc(e);D.clicked=1;D.at=Date.now();e.click();return 'wait';
   }
+  if(!D.shared){
+    var s=document.querySelector('[data-e2e="share-icon"],[data-e2e*="share"]');
+    if(s){btnOf(s).click();D.shared=1;}
+    return 'wait';
+  }
+  var mi=findMenuItem();
+  if(mi){D.desc='menu:'+desc(mi);D.clicked=1;D.at=Date.now();mi.click();return 'wait';}
   return 'wait';
+})()"""
+
+    // Что пойман для повтора: запрос, который сайт отправил при удалении (с id видео внутри)
+    const val TPL = """(function(){var D=window.__drD;return D&&D.tpl?D.tpl:null;})()"""
+
+    // Если не получилось: что на странице (data-e2e кнопок, подписи, последние запросы) — для журнала отладки
+    const val DIAG = """(function(){
+  var D=window.__drD||{};
+  var e2=[],seen={};
+  var els=document.querySelectorAll('[data-e2e]');
+  for(var i=0;i<els.length&&e2.length<45;i++){var k=els[i].getAttribute('data-e2e');if(!seen[k]){seen[k]=1;e2.push(k);}}
+  var ar=[];var bs=document.querySelectorAll('button,[role="button"]');
+  for(var j=0;j<bs.length&&ar.length<25;j++){var a=(bs[j].getAttribute('aria-label')||(bs[j].textContent||'')).trim().slice(0,24);if(a)ar.push(a);}
+  var net=(D.net||[]).slice(-6).map(function(r){return r.m+' '+r.u.split('?')[0]+' '+r.s+'/'+r.c;});
+  return 'url='+location.pathname+' | нажато='+(D.desc||'нет')+' | e2e: '+e2.join(',')+' | кнопки: '+ar.join(',')+' | запросы: '+net.join(' ; ');
+})()"""
+
+    // Быстрый режим: повторяет пойманный запрос для другого id (через тот же fetch сайта, поэтому подписывается им же)
+    const val FAST_INIT = """(function(){
+  var D=window.__drD;if(!D||!D.tpl)return 'notpl';
+  if(window.__drF)return 'ready';
+  var F=window.__drF={inflight:0,res:[],last:'',sent:0};
+  window.__drFast=function(id){
+    var t=D.tpl,vid=D.vid;
+    var u=t.u.split(vid).join(id),b=(t.b||'').split(vid).join(id);
+    var init={method:t.m,credentials:'include'};
+    if(t.m!=='GET'&&b){
+      init.body=b;
+      init.headers={'Content-Type':t.ct||(b.charAt(0)==='{'?'application/json':'application/x-www-form-urlencoded')};
+    }
+    F.inflight++;F.sent++;
+    fetch(u,init).then(function(r){var st=r.status;return r.text().then(function(tx){return [st,tx];});}).then(function(a){
+      var code=null;
+      try{var j=JSON.parse(a[1]);code=(j.status_code!==undefined)?j.status_code:((j.statusCode!==undefined)?j.statusCode:null);}catch(e){code='x';}
+      var ok=(a[0]===200&&code===0)?1:0;
+      F.res.push({id:id,ok:ok,st:a[0],c:code});
+      if(!ok)F.last=a[0]+':'+code+':'+String(a[1]).slice(0,120);
+    }).catch(function(e){F.res.push({id:id,ok:0,st:0,c:'e'});F.last='net:'+e;}).then(function(){F.inflight--;});
+  };
+  return 'ok';
+})()"""
+
+    const val FAST_POLL = """(function(){
+  var F=window.__drF;if(!F)return {err:1};
+  var r=F.res.splice(0,F.res.length);
+  return {inflight:F.inflight,res:r,last:F.last,sent:F.sent};
 })()"""
 }

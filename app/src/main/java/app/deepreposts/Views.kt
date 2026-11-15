@@ -18,6 +18,7 @@ class BgView(ctx: Context) : View(ctx) {
     private val d = ctx.resources.displayMetrics.density
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     private val stars = ArrayList<FloatArray>()
+    private val village = Village(d)
 
     init {
         val r = Random(7)
@@ -46,6 +47,11 @@ class BgView(ctx: Context) : View(ctx) {
         p.color = c("#E3DAB4")
         cv.drawCircle(mx - 4 * d, my - 3 * d, 3 * d, p)
         cv.drawCircle(mx + 5 * d, my + 4 * d, 2 * d, p)
+        // деревня стоит на месте — прокручивается только интерфейс поверх неё
+        cv.save()
+        cv.translate(0f, 172 * d)
+        village.draw(cv, w)
+        cv.restore()
     }
 }
 
@@ -71,12 +77,9 @@ class GearView(ctx: Context) : View(ctx) {
 }
 
 /** Деревенька на снегу: три дома (два с включённым светом, один тёмный), ёлки, снеговики. */
-class SceneView(ctx: Context) : View(ctx) {
-    private val d = ctx.resources.displayMetrics.density
+class Village(private val d: Float) {
     private val p = Paint(Paint.ANTI_ALIAS_FLAG)
     private val path = Path()
-
-    override fun onMeasure(w: Int, h: Int) = setMeasuredDimension(MeasureSpec.getSize(w), (170 * d).toInt())
 
     private fun fill(color: Int) { p.shader = null; p.style = Paint.Style.FILL; p.color = color }
     private fun line(color: Int, wd: Float) { p.shader = null; p.style = Paint.Style.STROKE; p.color = color; p.strokeWidth = wd * d }
@@ -90,8 +93,7 @@ class SceneView(ctx: Context) : View(ctx) {
         cv.drawPath(path, p)
     }
 
-    override fun onDraw(cv: Canvas) {
-        val w = width.toFloat()
+    fun draw(cv: Canvas, w: Float) {
         val wd = w / d
         // дальние холмы
         fill(c("#1A3563"))
