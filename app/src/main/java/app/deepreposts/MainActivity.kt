@@ -86,7 +86,7 @@ class Cell(c: Context) : FrameLayout(c) {
 }
 
 class MainActivity : Activity() {
-    private enum class Mode { LOGIN, COLLECT, DELETE, IDLE }
+    private enum class Mode { LOGIN, RESOLVE, COLLECT, DELETE, IDLE }
 
     private val ui = Handler(Looper.getMainLooper())
     private lateinit var prefs: SharedPreferences
@@ -114,7 +114,8 @@ class MainActivity : Activity() {
     private var running = false
     private var serviceOn = false
     private var tabSeen = false
-    private var loginPolls = 0
+    private var sessionSeenAt = 0L
+    private var resolveStart = 0L
     private val logLines = ArrayList<String>()
     private var fastMode = false
     private var tpl: JSONObject? = null
@@ -132,8 +133,6 @@ class MainActivity : Activity() {
     private var lastSendAt = 0L
     private var lastLogged = 0L
     private var diagCount = 0
-    private var reloadedForUser = false
-    private var askedName = false
     private var user = ""
     private var qi = 0
     private var tries = 0
@@ -172,10 +171,11 @@ class MainActivity : Activity() {
         setContentView(root)
 
         askNotifications()
+        if (prefs.getInt("schema", 0) < 2) prefs.edit().remove("user").remove("avatar").putInt("schema", 2).apply()
         user = prefs.getString("user", "") ?: ""
         val cached = prefs.getString("avatar", "") ?: ""
         if (cached.isNotEmpty()) showAvatar(cached)
-        if (user.isNotEmpty()) { showApp(); startCollect() } else showLogin()
+        if (user.isNotEmpty()) startResolve() else showLogin()   // каждый запуск сверяем аккаунт с TikTok
     }
 
     override fun onPause() { CookieManager.getInstance().flush(); super.onPause() }
@@ -195,7 +195,7 @@ class MainActivity : Activity() {
         when {
             settingsView.visibility == View.VISIBLE -> closeSettings()
             mode == Mode.LOGIN && web.canGoBack() -> web.goBack()
-            running || mode == Mode.COLLECT -> moveTaskToBack(true)   // не закрываем — работа продолжается
+            running || mode == Mode.COLLECT || mode == Mode.RESOLVE -> moveTaskToBack(true)   // не закрываем — работа продолжается
             else -> super.onBackPressed()
         }
     }
@@ -244,6 +244,7 @@ class MainActivity : Activity() {
             running -> { armed = true; tries = 0; web.loadUrl(queue[qi].url) }
             mode == Mode.COLLECT -> failCollect("Окно браузера было перезапущено системой. Откройте настройки и нажмите «Обновить список репостов».")
             mode == Mode.LOGIN -> web.loadUrl("https://www.tiktok.com/login")
+            mode == Mode.RESOLVE -> web.loadUrl("https://www.tiktok.com/profile")
         }
     }
 
@@ -281,47 +282,65 @@ class MainActivity : Activity() {
         web.layoutParams = FrameLayout.LayoutParams(MATCH, MATCH).apply { bottomMargin = px }
     }
 
+    // Пока идёт вход, приложение НИЧЕГО не трогает в браузере: только смотрит, появилась ли сессия.
     private val poll = object : Runnable {
         override fun run() {
             if (mode != Mode.LOGIN) return
             CookieManager.getInstance().flush()
             val ok = sessionOk()
-            web.evaluateJavascript(Scripts.LOGIN_STATE) outer@{ st ->
-                if (mode != Mode.LOGIN) return@outer
-                val out = (st ?: "").contains("out")
-                tvLoginInfo.text = "Сессия: " + (if (ok) "есть" else "нет") + " · кнопка «Войти»: " + (if (out) "есть" else "нет") +
-                    "\nCookies: " + cookieNames() + "\n" + (web.url ?: "").removePrefix("https://").take(50)
-                if (!ok && out) { loginPolls = 0; ui.postDelayed(this, 2000); return@outer }
-                loginPolls++
-                web.evaluateJavascript(Scripts.USER) inner@{ r ->
-                    val name = (r ?: "").trim('"')
-                    if (name.isNotEmpty() && name != "null" && mode == Mode.LOGIN) {
-                        loggedIn(name)
-                        return@inner
-                    }
-                    // страница входа закрылась, а аккаунт не виден — открываем главную заново
-                    if (loginPolls == 8 && !reloadedForUser && !(web.url ?: "").contains("login")) {
-                        reloadedForUser = true
-                        web.loadUrl("https://www.tiktok.com/")
-                    }
-                    if (loginPolls >= 15 && !askedName) { askedName = true; askUsername() }
-                    ui.postDelayed(this, 2000)
+            tvLoginInfo.text = (if (ok) "Вход обнаружен — открываю приложение…" else "Войдите в TikTok на странице выше. После входа приложение откроется само.") +
+                "\ncookies: " + cookieNames()
+            if (ok) {
+                if (sessionSeenAt == 0L) sessionSeenAt = System.currentTimeMillis()
+                // даём TikTok 3 секунды закончить собственные переходы после входа
+                if (System.currentTimeMillis() - sessionSeenAt > 3000) { startResolve(); return }
+            } else sessionSeenAt = 0L
+            ui.postDelayed(this, 1000)
+        }
+    }
+
+    /** Кнопка «Я вошёл(а)»: проверяем вход у самого TikTok (без неё приложение само замечает вход по cookies). */
+    private fun manualLogin() { if (mode == Mode.LOGIN) startResolve() }
+
+    // Кто вошёл — знает только TikTok: адрес /profile для вошедшего открывает его страницу /@имя,
+    // для не вошедшего перекидывает на /foryou. Имя никогда не вводится вручную.
+    private fun startResolve() {
+        ui.removeCallbacks(poll)
+        setMode(Mode.RESOLVE)
+        resolveStart = System.currentTimeMillis()
+        showApp()
+        tvUser.text = "Определяю аккаунт…"
+        tvStatus.text = "Проверяю вход в TikTok…"
+        note("Вход в TikTok…")
+        dlog("проверка входа: открываю /profile")
+        web.loadUrl("https://www.tiktok.com/profile")
+        ui.removeCallbacks(resolveTick); ui.postDelayed(resolveTick, 700)
+    }
+
+    private val resolveTick = object : Runnable {
+        override fun run() {
+            if (mode != Mode.RESOLVE) return
+            val url = web.url ?: ""
+            val m = Regex("tiktok\\.com/@([^/?#]+)").find(url)
+            val path = url.substringAfter("tiktok.com", "").substringBefore("?").substringBefore("#")
+            val waited = System.currentTimeMillis() - resolveStart
+            when {
+                m != null -> {
+                    val name = Uri.decode(m.groupValues[1])
+                    dlog("аккаунт определён: @$name")
+                    loggedIn(name)
                 }
+                waited > 2500 && path.startsWith("/foryou") -> failResolve("TikTok не подтвердил вход (он вернул ленту рекомендаций)")
+                waited > 25000 -> failResolve("TikTok не ответил за 25 секунд (адрес: $url)")
+                else -> ui.postDelayed(this, 500)
             }
         }
     }
 
-    /** Кнопка «Я вошёл(а)»: не ждём автоопределения. */
-    private fun manualLogin() {
-        val ok = sessionOk()
-        web.evaluateJavascript(Scripts.LOGIN_STATE) outer@{ st ->
-            val out = (st ?: "").contains("out")
-            if (!ok && out) { toast("TikTok ещё не завершил вход: на странице осталась кнопка «Войти»."); return@outer }
-            web.evaluateJavascript(Scripts.USER) inner@{ r ->
-                val name = (r ?: "").trim('"')
-                if (name.isNotEmpty() && name != "null") loggedIn(name) else askUsername()
-            }
-        }
+    private fun failResolve(why: String) {
+        dlog("вход не подтверждён: $why")
+        toast("Вход не подтверждён. Войдите в TikTok ещё раз.")
+        showLogin()
     }
 
     private fun buildLoginBar(): LinearLayout {
@@ -329,28 +348,17 @@ class MainActivity : Activity() {
             orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
             setBackgroundColor(BG); setPadding(dp(12), dp(8), dp(12), dp(8))
         }
-        tvLoginInfo = TextView(this).apply { textSize = 11f; setTextColor(ICE); text = "Войдите в TikTok на странице выше" }
+        tvLoginInfo = TextView(this).apply { textSize = 11f; setTextColor(ICE); text = "Войдите в TikTok на странице выше. После входа приложение откроется само." }
         lb.addView(tvLoginInfo, LinearLayout.LayoutParams(0, WRAP, 1f))
         lb.addView(button("Я вошёл(а)", true).apply { textSize = 14f; setOnClickListener { manualLogin() } },
             LinearLayout.LayoutParams(WRAP, dp(44)).apply { leftMargin = dp(8) })
         return lb
     }
 
-    private fun askUsername() {
-        val et = android.widget.EditText(this).apply { hint = "например, maria_k"; setSingleLine(true) }
-        AlertDialog.Builder(this).setTitle("Введите ваш @юзернейм TikTok")
-            .setMessage("Не удалось определить аккаунт автоматически.")
-            .setView(et)
-            .setNegativeButton("Позже") { _, _ -> askedName = false; loginPolls = 5 }
-            .setPositiveButton("Готово") { _, _ ->
-                val n = et.text.toString().trim().removePrefix("@")
-                if (n.isNotEmpty() && mode == Mode.LOGIN) loggedIn(n) else { askedName = false; loginPolls = 5 }
-            }.show()
-    }
-
     private fun showLogin() {
         setMode(Mode.LOGIN)
-        loginPolls = 0; reloadedForUser = false; askedName = false
+        sessionSeenAt = 0L
+        ui.removeCallbacks(resolveTick)
         appLayer.visibility = View.GONE
         settingsView.visibility = View.GONE
         loginBar.visibility = View.VISIBLE
