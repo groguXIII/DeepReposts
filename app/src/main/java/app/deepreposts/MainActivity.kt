@@ -107,6 +107,11 @@ class MainActivity : Activity() {
     private lateinit var btnDelete: Button
     private lateinit var loginBar: LinearLayout
     private lateinit var btnSpeed: Button
+    private lateinit var verifyCard: LinearLayout
+    private lateinit var tvVerify: TextView
+    private lateinit var verifySpin: ProgressBar
+    private lateinit var btnVerifyRetry: Button
+    private lateinit var btnVerifyRelogin: Button
     private lateinit var tvLoginInfo: TextView
 
     private var mode = Mode.LOGIN
@@ -115,7 +120,7 @@ class MainActivity : Activity() {
     private var serviceOn = false
     private var tabSeen = false
     private var sessionSeenAt = 0L
-    private var resolveStart = 0L
+    private var verifyStart = 0L
     private val logLines = ArrayList<String>()
     private var fastMode = false
     private var tpl: JSONObject? = null
@@ -164,6 +169,9 @@ class MainActivity : Activity() {
         settingsView = buildSettings()
         settingsView.visibility = View.GONE
         appLayer.addView(settingsView, FrameLayout.LayoutParams(MATCH, MATCH))
+        verifyCard = buildVerifyCard()
+        verifyCard.visibility = View.GONE
+        appLayer.addView(verifyCard, FrameLayout.LayoutParams(MATCH, WRAP, Gravity.CENTER).apply { setMargins(dp(24), 0, dp(24), 0) })
         appLayer.visibility = View.GONE
         root.addView(appLayer, FrameLayout.LayoutParams(MATCH, MATCH))
         loginBar = buildLoginBar()
@@ -175,7 +183,7 @@ class MainActivity : Activity() {
         user = prefs.getString("user", "") ?: ""
         val cached = prefs.getString("avatar", "") ?: ""
         if (cached.isNotEmpty()) showAvatar(cached)
-        if (user.isNotEmpty()) startResolve() else showLogin()   // каждый запуск сверяем аккаунт с TikTok
+        if (user.isNotEmpty()) startVerify() else showLogin()   // каждый запуск сверяем аккаунт с TikTok
     }
 
     override fun onPause() { CookieManager.getInstance().flush(); super.onPause() }
@@ -216,7 +224,7 @@ class MainActivity : Activity() {
 
             // видео и картинки браузеру не нужны: так страницы грузятся в разы быстрее и не тратят трафик
             override fun shouldInterceptRequest(v: WebView, r: WebResourceRequest): WebResourceResponse? {
-                if (mode == Mode.COLLECT || mode == Mode.DELETE) {
+                if (mode == Mode.COLLECT || mode == Mode.DELETE || mode == Mode.RESOLVE) {
                     val u = r.url.toString()
                     if (u.contains(".mp4") || u.contains("mime_type=video") || u.contains("/video/tos/")) {
                         return WebResourceResponse("text/plain", "utf-8", ByteArrayInputStream(ByteArray(0)))
@@ -239,18 +247,18 @@ class MainActivity : Activity() {
         web = makeWeb()
         root.addView(web, if (idx < 0) 0 else idx, FrameLayout.LayoutParams(MATCH, MATCH))
         webMargin(if (mode == Mode.LOGIN) dp(96) else 0)
-        web.settings.blockNetworkImage = mode == Mode.COLLECT || mode == Mode.DELETE
+        web.settings.blockNetworkImage = mode == Mode.COLLECT || mode == Mode.DELETE || mode == Mode.RESOLVE
         when {
             running -> { armed = true; tries = 0; web.loadUrl(queue[qi].url) }
             mode == Mode.COLLECT -> failCollect("Окно браузера было перезапущено системой. Откройте настройки и нажмите «Обновить список репостов».")
             mode == Mode.LOGIN -> web.loadUrl("https://www.tiktok.com/login")
-            mode == Mode.RESOLVE -> web.loadUrl("https://www.tiktok.com/profile")
+            mode == Mode.RESOLVE -> startVerify()
         }
     }
 
     private fun setMode(m: Mode) {
         mode = m
-        web.settings.blockNetworkImage = m == Mode.COLLECT || m == Mode.DELETE
+        web.settings.blockNetworkImage = m == Mode.COLLECT || m == Mode.DELETE || m == Mode.RESOLVE
     }
 
     private fun pageDone() {
@@ -293,54 +301,77 @@ class MainActivity : Activity() {
             if (ok) {
                 if (sessionSeenAt == 0L) sessionSeenAt = System.currentTimeMillis()
                 // даём TikTok 3 секунды закончить собственные переходы после входа
-                if (System.currentTimeMillis() - sessionSeenAt > 3000) { startResolve(); return }
+                if (System.currentTimeMillis() - sessionSeenAt > 3000) { startVerify(); return }
             } else sessionSeenAt = 0L
             ui.postDelayed(this, 1000)
         }
     }
 
-    /** Кнопка «Я вошёл(а)»: проверяем вход у самого TikTok (без неё приложение само замечает вход по cookies). */
-    private fun manualLogin() { if (mode == Mode.LOGIN) startResolve() }
+    /** Кнопка внизу экрана входа. */
+    private fun manualLogin() { if (mode == Mode.LOGIN) startVerify() }
 
-    // Кто вошёл — знает только TikTok: адрес /profile для вошедшего открывает его страницу /@имя,
-    // для не вошедшего перекидывает на /foryou. Имя никогда не вводится вручную.
-    private fun startResolve() {
+    // Проверка входа: браузер скрыт, поверх — интерфейс приложения с карточкой. Главная TikTok загружается
+    // заново, и у неё спрашивают, чей это аккаунт. Имя НИКОГДА не вводится вручную.
+    private fun startVerify() {
         ui.removeCallbacks(poll)
         setMode(Mode.RESOLVE)
-        resolveStart = System.currentTimeMillis()
+        verifyStart = System.currentTimeMillis()
         showApp()
-        tvUser.text = "Определяю аккаунт…"
-        tvStatus.text = "Проверяю вход в TikTok…"
+        tvUser.text = "…"
+        verifyCard.visibility = View.VISIBLE
+        verifySpin.visibility = View.VISIBLE
+        btnVerifyRetry.visibility = View.GONE
+        btnVerifyRelogin.visibility = View.GONE
+        tvVerify.text = "Проверяю вход в TikTok…"
         note("Вход в TikTok…")
-        dlog("проверка входа: открываю /profile")
-        web.loadUrl("https://www.tiktok.com/profile")
-        ui.removeCallbacks(resolveTick); ui.postDelayed(resolveTick, 700)
+        dlog("проверка входа: загружаю главную TikTok")
+        web.loadUrl("https://www.tiktok.com/foryou")
+        ui.removeCallbacks(verifyTick); ui.postDelayed(verifyTick, 2500)
     }
 
-    private val resolveTick = object : Runnable {
+    private val verifyTick = object : Runnable {
         override fun run() {
             if (mode != Mode.RESOLVE) return
-            val url = web.url ?: ""
-            val m = Regex("tiktok\\.com/@([^/?#]+)").find(url)
-            val path = url.substringAfter("tiktok.com", "").substringBefore("?").substringBefore("#")
-            val waited = System.currentTimeMillis() - resolveStart
-            when {
-                m != null -> {
-                    val name = Uri.decode(m.groupValues[1])
-                    dlog("аккаунт определён: @$name")
+            web.evaluateJavascript(Scripts.WHOAMI) { r ->
+                if (mode != Mode.RESOLVE) return@evaluateJavascript
+                val o = try { JSONObject(r ?: "") } catch (e: Exception) { null }
+                val name = o?.optString("name") ?: ""
+                if (name.isNotEmpty()) {
+                    dlog("аккаунт определён: @" + name + " (" + o?.optString("how") + ")")
                     loggedIn(name)
-                }
-                waited > 2500 && path.startsWith("/foryou") -> failResolve("TikTok не подтвердил вход (он вернул ленту рекомендаций)")
-                waited > 25000 -> failResolve("TikTok не ответил за 25 секунд (адрес: $url)")
-                else -> ui.postDelayed(this, 500)
+                } else if (System.currentTimeMillis() - verifyStart > 22000) {
+                    failVerify(o?.optString("how") ?: "страница не ответила", o?.optString("url") ?: "")
+                } else ui.postDelayed(this, 1000)
             }
         }
     }
 
-    private fun failResolve(why: String) {
-        dlog("вход не подтверждён: $why")
-        toast("Вход не подтверждён. Войдите в TikTok ещё раз.")
-        showLogin()
+    private fun failVerify(how: String, path: String) {
+        val txt = "Не удалось определить аккаунт.\nСессия: " + (if (sessionOk()) "есть" else "нет") +
+            "\ncookies: " + cookieNames() + "\nСтраница: " + path + "\n" + how
+        dlog("вход не определён: " + txt.replace("\n", " | "))
+        verifySpin.visibility = View.GONE
+        tvVerify.text = txt
+        btnVerifyRetry.visibility = View.VISIBLE
+        btnVerifyRelogin.visibility = View.VISIBLE
+    }
+
+    private fun buildVerifyCard(): LinearLayout {
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL; gravity = Gravity.CENTER_HORIZONTAL
+            background = round(PANEL, 20); setPadding(dp(20), dp(20), dp(20), dp(16)); isClickable = true
+        }
+        card.addView(TextView(this).apply { text = "Вход в TikTok"; textSize = 18f; setTypeface(null, Typeface.BOLD); setTextColor(ICE) })
+        tvVerify = TextView(this).apply { textSize = 12f; setTextColor(Color.WHITE); gravity = Gravity.CENTER }
+        card.addView(tvVerify, lp(10))
+        verifySpin = ProgressBar(this)
+        card.addView(verifySpin, LinearLayout.LayoutParams(dp(36), dp(36)).apply { topMargin = dp(12) })
+        btnVerifyRetry = button("Я вошёл — проверить ещё раз", true).apply { setOnClickListener { startVerify() } }
+        card.addView(btnVerifyRetry, lp(14, dp(48)))
+        btnVerifyRelogin = button("Войти заново", false).apply { setOnClickListener { showLogin() } }
+        card.addView(btnVerifyRelogin, lp(8, dp(48)))
+        card.addView(button("Журнал отладки", false).apply { textSize = 13f; setOnClickListener { showLog() } }, lp(8, dp(44)))
+        return card
     }
 
     private fun buildLoginBar(): LinearLayout {
@@ -350,6 +381,8 @@ class MainActivity : Activity() {
         }
         tvLoginInfo = TextView(this).apply { textSize = 11f; setTextColor(ICE); text = "Войдите в TikTok на странице выше. После входа приложение откроется само." }
         lb.addView(tvLoginInfo, LinearLayout.LayoutParams(0, WRAP, 1f))
+        lb.addView(button("Журнал", false).apply { textSize = 12f; setOnClickListener { showLog() } },
+            LinearLayout.LayoutParams(WRAP, dp(44)).apply { leftMargin = dp(8) })
         lb.addView(button("Я вошёл(а)", true).apply { textSize = 14f; setOnClickListener { manualLogin() } },
             LinearLayout.LayoutParams(WRAP, dp(44)).apply { leftMargin = dp(8) })
         return lb
@@ -358,7 +391,8 @@ class MainActivity : Activity() {
     private fun showLogin() {
         setMode(Mode.LOGIN)
         sessionSeenAt = 0L
-        ui.removeCallbacks(resolveTick)
+        ui.removeCallbacks(verifyTick)
+        verifyCard.visibility = View.GONE
         appLayer.visibility = View.GONE
         settingsView.visibility = View.GONE
         loginBar.visibility = View.VISIBLE
@@ -380,6 +414,7 @@ class MainActivity : Activity() {
         user = name
         prefs.edit().putString("user", name).apply()
         CookieManager.getInstance().flush()
+        verifyCard.visibility = View.GONE
         showApp()
         startCollect()
     }
@@ -1322,6 +1357,46 @@ object Scripts {
   var mi=findMenuItem();
   if(mi){D.desc='menu:'+desc(mi);D.clicked=1;D.at=Date.now();mi.click();return 'wait';}
   return 'wait';
+})()"""
+
+    // Кто вошёл: данные страницы (SSR), затем ссылка «Профиль» в меню, затем нажатие на «Профиль».
+    const val WHOAMI = """(function(){
+  var W=window.__drW||(window.__drW={n:0,clicked:0});
+  W.n++;
+  var res={name:'',how:'',url:location.pathname,n:W.n};
+  try{
+    var el=document.getElementById('__UNIVERSAL_DATA_FOR_REHYDRATION__');
+    if(el){
+      var d=JSON.parse(el.textContent);
+      var sc=d['__DEFAULT_SCOPE__']||{};
+      var ctx=sc['webapp.app-context']||{};
+      var u=ctx.user;
+      if(u&&u.uniqueId){res.name=String(u.uniqueId);res.how='данные страницы';return res;}
+      var m=JSON.stringify(ctx).match(/"uniqueId":"([^"]+)"/);
+      if(m){res.name=m[1];res.how='данные страницы (контекст)';return res;}
+      res.how='в данных страницы нет аккаунта; ключи: '+Object.keys(sc).slice(0,10).join(',');
+    }else res.how='нет данных страницы';
+  }catch(e){res.how='ошибка данных: '+e;}
+  var sels=['[data-e2e="nav-profile"]','a[data-e2e*="profile" i]','a[aria-label*="rofile"]','a[aria-label*="рофиль"]'];
+  for(var i=0;i<sels.length;i++){
+    var a=document.querySelector(sels[i]);
+    if(a){
+      var h=a.getAttribute('href')||((a.closest&&a.closest('a'))?a.closest('a').getAttribute('href'):'')||'';
+      var mm=h.match(/\/@([^\/?#]+)/);
+      if(mm){res.name=mm[1];res.how='меню '+sels[i];return res;}
+    }
+  }
+  if(W.n>=5){
+    var leaf=null,all=document.querySelectorAll('a,button,div,span,p');
+    for(var j=0;j<all.length;j++){
+      var x=all[j];
+      if(x.children.length===0){var t=(x.textContent||'').trim();if(t==='Profile'||t==='Профиль'){leaf=x;break;}}
+    }
+    if(leaf&&!W.clicked){W.clicked=1;(leaf.closest('a,button,[role="button"]')||leaf).click();res.how+=' | нажал «Профиль»';}
+    var pm=location.pathname.match(/^\/@([^\/?#]+)/);
+    if(pm){res.name=pm[1];res.how='после нажатия «Профиль»';return res;}
+  }
+  return res;
 })()"""
 
     // Что пойман для повтора: запрос, который сайт отправил при удалении (с id видео внутри)
