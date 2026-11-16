@@ -44,6 +44,7 @@ import androidx.recyclerview.widget.GridLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import coil.load
 import coil.transform.CircleCropTransformation
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.ByteArrayInputStream
 import java.io.File
@@ -57,6 +58,7 @@ const val WRAP = ViewGroup.LayoutParams.WRAP_CONTENT
 const val LIMIT = 2500            // удалений в сутки
 const val LOAD_LIMIT = 50000      // максимум загружаемых репостов
 const val DAY_MS = 24L * 60 * 60 * 1000
+const val MOBILE_UA = "Mozilla/5.0 (Linux; Android 13; SM-S918B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 const val DESKTOP_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 val BG = Color.parseColor("#0A1428")
 val PANEL = Color.parseColor("#13264A")
@@ -107,6 +109,8 @@ class MainActivity : Activity() {
     private lateinit var btnDelete: Button
     private lateinit var loginBar: LinearLayout
     private lateinit var btnSpeed: Button
+    private lateinit var btnUa: Button
+    private var lastLoginNet = ""
     private lateinit var verifyCard: LinearLayout
     private lateinit var tvVerify: TextView
     private lateinit var verifySpin: ProgressBar
@@ -175,7 +179,7 @@ class MainActivity : Activity() {
         appLayer.visibility = View.GONE
         root.addView(appLayer, FrameLayout.LayoutParams(MATCH, MATCH))
         loginBar = buildLoginBar()
-        root.addView(loginBar, FrameLayout.LayoutParams(MATCH, dp(96), Gravity.BOTTOM))
+        root.addView(loginBar, FrameLayout.LayoutParams(MATCH, dp(132), Gravity.BOTTOM))
         setContentView(root)
 
         askNotifications()
@@ -217,6 +221,7 @@ class MainActivity : Activity() {
         settings.builtInZoomControls = true
         settings.displayZoomControls = false
         settings.mediaPlaybackRequiresUserGesture = true
+        settings.javaScriptCanOpenWindowsAutomatically = true   // окна проверки/капчи при входе не должны блокироваться
         settings.userAgentString = DESKTOP_UA
         CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
         webViewClient = object : WebViewClient() {
@@ -246,12 +251,12 @@ class MainActivity : Activity() {
         web.destroy()
         web = makeWeb()
         root.addView(web, if (idx < 0) 0 else idx, FrameLayout.LayoutParams(MATCH, MATCH))
-        webMargin(if (mode == Mode.LOGIN) dp(96) else 0)
+        webMargin(if (mode == Mode.LOGIN) dp(132) else 0)
         web.settings.blockNetworkImage = mode == Mode.COLLECT || mode == Mode.DELETE || mode == Mode.RESOLVE
         when {
             running -> { armed = true; tries = 0; web.loadUrl(queue[qi].url) }
             mode == Mode.COLLECT -> failCollect("Окно браузера было перезапущено системой. Откройте настройки и нажмите «Обновить список репостов».")
-            mode == Mode.LOGIN -> web.loadUrl("https://www.tiktok.com/login")
+            mode == Mode.LOGIN -> { web.settings.userAgentString = loginUa(); web.loadUrl("https://www.tiktok.com/login") }
             mode == Mode.RESOLVE -> startVerify()
         }
     }
@@ -277,6 +282,21 @@ class MainActivity : Activity() {
         return sb.toString()
     }
 
+    private fun loginUa(): String = if (prefs.getBoolean("loginMobile", true)) MOBILE_UA else DESKTOP_UA
+
+    private fun updateUaButton() {
+        btnUa.text = if (prefs.getBoolean("loginMobile", true)) "Режим: телефон" else "Режим: компьютер"
+    }
+
+    private fun toggleLoginUa() {
+        if (mode != Mode.LOGIN) return
+        prefs.edit().putBoolean("loginMobile", !prefs.getBoolean("loginMobile", true)).apply()
+        updateUaButton()
+        web.settings.userAgentString = loginUa()
+        dlog("режим входа: " + (if (prefs.getBoolean("loginMobile", true)) "телефон" else "компьютер"))
+        web.loadUrl("https://www.tiktok.com/login")
+    }
+
     private fun sessionOk(): Boolean {
         val c = cookieString()
         return c.contains("sessionid=") || c.contains("sid_tt=") || c.contains("sid_guard=") || c.contains("uid_tt=")
@@ -284,7 +304,7 @@ class MainActivity : Activity() {
 
     // только ИМЕНА cookies (без значений) — для диагностики на экране входа
     private fun cookieNames(): String =
-        cookieString().split(";").map { it.trim().substringBefore("=") }.filter { it.isNotEmpty() }.distinct().take(9).joinToString(", ").ifEmpty { "нет" }
+        cookieString().split(";").map { it.trim().substringBefore("=") }.filter { it.isNotEmpty() }.distinct().take(40).joinToString(", ").ifEmpty { "нет" }
 
     private fun webMargin(px: Int) {
         web.layoutParams = FrameLayout.LayoutParams(MATCH, MATCH).apply { bottomMargin = px }
@@ -295,9 +315,17 @@ class MainActivity : Activity() {
         override fun run() {
             if (mode != Mode.LOGIN) return
             CookieManager.getInstance().flush()
+            // что отвечает сервер входа TikTok (код ошибки/описание) — попадает в журнал и в панель
+            web.evaluateJavascript(Scripts.LOGIN_NET) { r ->
+                try {
+                    val arr = JSONArray(r ?: "[]")
+                    for (i in 0 until arr.length()) { lastLoginNet = arr.getString(i); dlog("вход: $lastLoginNet") }
+                } catch (e: Exception) { }
+            }
             val ok = sessionOk()
             tvLoginInfo.text = (if (ok) "Вход обнаружен — открываю приложение…" else "Войдите в TikTok на странице выше. После входа приложение откроется само.") +
-                "\ncookies: " + cookieNames()
+                (if (lastLoginNet.isNotEmpty()) "\nответ TikTok: " + lastLoginNet.take(110) else "") +
+                "\ncookies: " + cookieNames().take(90)
             if (ok) {
                 if (sessionSeenAt == 0L) sessionSeenAt = System.currentTimeMillis()
                 // даём TikTok 3 секунды закончить собственные переходы после входа
@@ -325,6 +353,7 @@ class MainActivity : Activity() {
         tvVerify.text = "Проверяю вход в TikTok…"
         note("Вход в TikTok…")
         dlog("проверка входа: загружаю главную TikTok")
+        web.settings.userAgentString = DESKTOP_UA
         web.loadUrl("https://www.tiktok.com/foryou")
         ui.removeCallbacks(verifyTick); ui.postDelayed(verifyTick, 2500)
     }
@@ -376,15 +405,20 @@ class MainActivity : Activity() {
 
     private fun buildLoginBar(): LinearLayout {
         val lb = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+            orientation = LinearLayout.VERTICAL
             setBackgroundColor(BG); setPadding(dp(12), dp(8), dp(12), dp(8))
         }
-        tvLoginInfo = TextView(this).apply { textSize = 11f; setTextColor(ICE); text = "Войдите в TikTok на странице выше. После входа приложение откроется само." }
-        lb.addView(tvLoginInfo, LinearLayout.LayoutParams(0, WRAP, 1f))
-        lb.addView(button("Журнал", false).apply { textSize = 12f; setOnClickListener { showLog() } },
-            LinearLayout.LayoutParams(WRAP, dp(44)).apply { leftMargin = dp(8) })
-        lb.addView(button("Я вошёл(а)", true).apply { textSize = 14f; setOnClickListener { manualLogin() } },
-            LinearLayout.LayoutParams(WRAP, dp(44)).apply { leftMargin = dp(8) })
+        tvLoginInfo = TextView(this).apply { textSize = 11f; setTextColor(ICE); maxLines = 5; text = "Войдите в TikTok на странице выше. После входа приложение откроется само." }
+        lb.addView(tvLoginInfo, LinearLayout.LayoutParams(MATCH, WRAP))
+        val row = LinearLayout(this)
+        btnUa = button("", false).apply { textSize = 12f; setOnClickListener { toggleLoginUa() } }
+        row.addView(btnUa, LinearLayout.LayoutParams(0, dp(44), 1f))
+        row.addView(button("Журнал", false).apply { textSize = 12f; setOnClickListener { showLog() } },
+            LinearLayout.LayoutParams(0, dp(44), 0.8f).apply { leftMargin = dp(6) })
+        row.addView(button("Я вошёл(а)", true).apply { textSize = 13f; setOnClickListener { manualLogin() } },
+            LinearLayout.LayoutParams(0, dp(44), 1.1f).apply { leftMargin = dp(6) })
+        lb.addView(row, lp(6, dp(44)))
+        updateUaButton()
         return lb
     }
 
@@ -396,8 +430,9 @@ class MainActivity : Activity() {
         appLayer.visibility = View.GONE
         settingsView.visibility = View.GONE
         loginBar.visibility = View.VISIBLE
-        webMargin(dp(96))
+        webMargin(dp(132))
         note("Вход в TikTok…")
+        web.settings.userAgentString = loginUa()
         web.loadUrl("https://www.tiktok.com/login")
         ui.removeCallbacks(poll); ui.postDelayed(poll, 2000)
     }
@@ -1357,6 +1392,43 @@ object Scripts {
   var mi=findMenuItem();
   if(mi){D.desc='menu:'+desc(mi);D.clicked=1;D.at=Date.now();mi.click();return 'wait';}
   return 'wait';
+})()"""
+
+    // Во время входа: «подслушивает» ответы сервера входа TikTok (код ошибки и описание) и отдаёт их приложению.
+    const val LOGIN_NET = """(function(){
+  var L=window.__drL;
+  if(!L){
+    L=window.__drL={q:[]};
+    var rec=function(m,u,st,t){
+      try{
+        var path=String(u).split('?')[0];
+        if(path.indexOf('passport')<0&&path.indexOf('login')<0&&path.indexOf('verify')<0)return;
+        var d=null;try{d=JSON.parse(t);}catch(e){}
+        var dd=(d&&d.data)||{};
+        var code=(dd.error_code!==undefined)?dd.error_code:((d&&d.error_code!==undefined)?d.error_code:'');
+        var desc=dd.description||(d&&d.description)||(d&&d.message)||'';
+        L.q.push(m+' '+path.replace('https://www.tiktok.com','')+' http='+st+' код='+code+' '+String(desc).slice(0,80));
+      }catch(e){}
+    };
+    var of=window.fetch;
+    window.fetch=function(input,init){
+      var u=(typeof input==='string')?input:((input&&input.url)||'');
+      var m=String((init&&init.method)||(input&&input.method)||'GET').toUpperCase();
+      var p=of.apply(this,arguments);
+      if(m!=='GET'){p.then(function(r){var st=r.status;return r.clone().text().then(function(t){rec(m,u,st,t);});}).catch(function(){});}
+      return p;
+    };
+    var xo=XMLHttpRequest.prototype.open,xs=XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.open=function(m,u){this.__m=String(m).toUpperCase();this.__u=String(u);return xo.apply(this,arguments);};
+    XMLHttpRequest.prototype.send=function(b){
+      var x=this;
+      x.addEventListener('load',function(){
+        if(x.__m&&x.__m!=='GET'){var t='';try{t=x.responseText;}catch(e){}rec(x.__m,x.__u,x.status,t);}
+      });
+      return xs.apply(this,arguments);
+    };
+  }
+  return L.q.splice(0,L.q.length);
 })()"""
 
     // Кто вошёл: данные страницы (SSR), затем ссылка «Профиль» в меню, затем нажатие на «Профиль».
