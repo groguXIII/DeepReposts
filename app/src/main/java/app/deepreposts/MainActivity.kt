@@ -626,7 +626,7 @@ class MainActivity : Activity() {
         if (added == 0 && idle > 6000 && now - lastLogged > 6000) {
             lastLogged = now
             dlog("загрузка: n=" + items.size + " api=" + o.optInt("api") + " ошибок=" + o.optInt("fails") + " hasMore=" + more +
-                " tab=" + tab + " http=" + o.optInt("st") + " ответ=" + o.optString("le"))
+                " tab=" + tab + " http=" + o.optInt("st") + " путь=" + o.optInt("cb") + " ответ=" + o.optString("le") + " трасса=" + o.optString("tr"))
         }
         when {
             tab && ((more == false && idle > 10000) || items.size >= LOAD_LIMIT) -> finishCollect()
@@ -637,7 +637,7 @@ class MainActivity : Activity() {
             }
             !tab && o.optInt("tries") >= 30 -> failCollect(
                 "Не нашёл вкладку «Репосты».\nАдрес: " + o.optString("url") + "\nВкладки: " + o.optString("info") + "\nЗаголовок: " + o.optString("title"))
-            tab && idle > 25000 ->
+            tab && idle > 60000 ->
                 if (items.isNotEmpty()) finishCollect()
                 else failCollect("Репосты не загрузились.\nОтветов TikTok: " + o.optInt("api") + ", ошибок: " + o.optInt("fails") + "\n" + o.optString("le"))
             else -> {
@@ -1178,7 +1178,7 @@ object Scripts {
     // (id, обложка, автор) — так не нужно листать страницу и читать картинки с экрана.
     const val INIT = """(function(){
   if(window.__dr)return 'already';
-  var S=window.__dr={m:{},q:[],n:0,api:0,more:null,cursor:null,tpl:null,busy:false,busyAt:0,fails:0,tab:0,tabTry:0,tabAt:0,av:'',variant:0,stall:0,le:'',st:0,sc:0};
+  var S=window.__dr={m:{},q:[],n:0,api:0,more:null,cursor:null,tpl:null,busy:false,busyAt:0,fails:0,tab:0,tabTry:0,tabAt:0,av:'',variant:0,stall:0,le:'',st:0,sc:0,tr:[],combo:0,waitUntil:0,before:0};
   var LIM=50000;
   function add(it){
     try{
@@ -1193,10 +1193,14 @@ object Scripts {
     try{
       if(!url||String(url).indexOf('repost')<0||!d||!d.itemList)return;
       S.api++;S.tpl=String(url);
+      var nb=S.n;
       for(var i=0;i<d.itemList.length;i++)add(d.itemList[i]);
       S.more=!!d.hasMore;S.cursor=d.cursor;
+      S.tr.push('+'+(S.n-nb)+'/'+d.itemList.length+' hm='+(d.hasMore?1:0)+' c='+d.cursor);
+      if(S.tr.length>8)S.tr.shift();
     }catch(e){}
   }
+  S.tap=tap;
   var oj=Response.prototype.json,ot=Response.prototype.text;
   Response.prototype.json=function(){var self=this;return oj.call(this).then(function(d){tap(self.url,d);return d;});};
   Response.prototype.text=function(){var self=this;return ot.call(this).then(function(t){
@@ -1252,23 +1256,45 @@ object Scripts {
       S.q.push({id:m[1],url:ls[i].href,cover:im?im.src:''});
     }
   }
+  function parse(tx){try{return JSON.parse(tx);}catch(e){return null;}}
+  // Ответ на наш запрос страницы списка. Ответ сайта-перехватчика (INIT) обрабатывается чуть позже — ждём.
+  function done(st,tx){
+    S.st=st;
+    var d=parse(tx);
+    if(d&&d.itemList){
+      S.fails=0;
+      try{S.tap(S.tpl,d);}catch(e){}
+      setTimeout(function(){
+        if(S.n===S.before)S.stall++;else S.stall=0;
+        if(S.stall>=3)S.fails=Math.max(S.fails,4);
+        S.busy=false;
+      },30);
+      return;
+    }
+    S.fails++;S.combo=(S.combo+1)%4;
+    S.le=st+': '+String(tx||'').slice(0,100)+' [путь '+S.combo+']';
+    S.waitUntil=Date.now()+Math.min(1500*S.fails,12000);
+    S.busy=false;
+  }
+  // пути: 0 = XHR без подписи в адресе, 1 = fetch без подписи, 2 = XHR с подписью, 3 = fetch с подписью
   function page(){
-    S.busy=true;S.busyAt=Date.now();
-    var before=S.n;
+    S.busy=true;S.busyAt=Date.now();S.before=S.n;
     var u=new URL(S.tpl);
     u.searchParams.set('cursor',S.cursor==null?'0':String(S.cursor));
-    if(!S.variant){u.searchParams.delete('X-Bogus');u.searchParams.delete('_signature');}
-    fetch(u.toString(),{credentials:'include'}).then(function(r){S.st=r.status;return r.text();}).then(function(tx){
-      var d=null;try{d=JSON.parse(tx);}catch(e){}
-      if(d&&d.itemList){
-        S.fails=0;
-        if(S.n===before)S.stall++;else S.stall=0;
-        if(S.stall>=3)S.fails=3;
-      }else{
-        S.fails++;S.variant=S.variant?0:1;S.le=S.st+': '+String(tx).slice(0,140);
-      }
-      S.busy=false;
-    }).catch(function(e){S.fails++;S.le='net: '+e;S.busy=false;});
+    var cnt=parseInt(u.searchParams.get('count')||'0',10);
+    if(cnt&&cnt<30)u.searchParams.set('count','30');
+    if(S.combo<2){u.searchParams.delete('X-Bogus');u.searchParams.delete('_signature');}
+    var url=u.toString();
+    if(S.combo%2===0){
+      var x=new XMLHttpRequest();
+      x.open('GET',url,true);x.withCredentials=true;x.timeout=15000;
+      x.onload=function(){done(x.status,x.responseText);};
+      x.onerror=function(){done(0,'xhr error');};
+      x.ontimeout=function(){done(0,'timeout');};
+      x.send();
+    }else{
+      fetch(url,{credentials:'include'}).then(function(r){var st=r.status;return r.text().then(function(tx){done(st,tx);});}).catch(function(e){done(0,'net '+e);});
+    }
   }
   if(!S.av){
     var av=document.querySelector('[data-e2e="user-avatar"] img')||document.querySelector('[data-e2e="user-avatar"]');
@@ -1278,10 +1304,10 @@ object Scripts {
     var t=findTab();
     if(t){t.click();S.tab=1;S.tabAt=Date.now();}else S.tabTry++;
   }else{
-    if(S.busy&&Date.now()-S.busyAt>15000){S.busy=false;S.fails++;S.le='timeout';}
-    if(S.tpl&&S.more!==false&&!S.busy&&S.fails<3&&S.n<LIM)page();
-    if((S.api===0&&Date.now()-S.tabAt>12000)||S.fails>=3)scrape();
-    if(Date.now()-S.sc>1500){S.sc=Date.now();window.scrollTo(0,document.documentElement.scrollHeight);}
+    if(S.busy&&Date.now()-S.busyAt>15000){S.busy=false;S.fails++;S.le='timeout';S.combo=(S.combo+1)%4;}
+    if(S.tpl&&S.more!==false&&!S.busy&&S.fails<12&&S.n<LIM&&Date.now()>=S.waitUntil)page();
+    if((S.api===0&&Date.now()-S.tabAt>12000)||S.fails>=4)scrape();
+    if(Date.now()-S.sc>700){S.sc=Date.now();window.scrollTo(0,document.documentElement.scrollHeight);}
   }
   function loginVisible(){
     if(document.querySelector('[data-e2e="top-login-button"],#header-login-button,[data-e2e="nav-login-button"],[data-e2e="login-button"]'))return true;
@@ -1296,7 +1322,7 @@ object Scripts {
   var info='';
   if(!S.tab&&S.tabTry>=25)info=tabs().map(function(e){return (e.textContent||'').trim()+'['+(e.getAttribute('data-e2e')||'')+']';}).join(' | ')||'нет';
   return {n:S.n,api:S.api,more:S.more,tab:S.tab,tries:S.tabTry,fails:S.fails,items:out,url:location.href,av:S.av,info:info,title:document.title,
-    le:S.le,st:S.st,lo:(!S.tab&&S.tabTry>=12)?loginVisible():false};
+    le:S.le,st:S.st,cb:S.combo,tr:S.tr.join(' ; '),lo:(!S.tab&&S.tabTry>=12)?loginVisible():false};
 })()"""
 
     // Страница видео: подсматривает запросы сайта, нажимает кнопку репоста ОДИН раз и ждёт, пока сайт
@@ -1490,23 +1516,39 @@ object Scripts {
     const val FAST_INIT = """(function(){
   var D=window.__drD;if(!D||!D.tpl)return 'notpl';
   if(window.__drF)return 'ready';
-  var F=window.__drF={inflight:0,res:[],last:'',sent:0};
+  var F=window.__drF={inflight:0,res:[],last:'',sent:0,pref:'xhr'};
+  function verdict(id,st,tx){
+    var code=null;
+    try{var j=JSON.parse(tx);code=(j.status_code!==undefined)?j.status_code:((j.statusCode!==undefined)?j.statusCode:null);}catch(e){code='x';}
+    return {id:id,ok:(st===200&&code===0)?1:0,st:st,c:code,tx:tx};
+  }
   window.__drFast=function(id){
     var t=D.tpl,vid=D.vid;
     var u=t.u.split(vid).join(id),b=(t.b||'').split(vid).join(id);
-    var init={method:t.m,credentials:'include'};
-    if(t.m!=='GET'&&b){
-      init.body=b;
-      init.headers={'Content-Type':t.ct||(b.charAt(0)==='{'?'application/json':'application/x-www-form-urlencoded')};
-    }
+    var ct=t.ct||(b.charAt(0)==='{'?'application/json':'application/x-www-form-urlencoded');
     F.inflight++;F.sent++;
-    fetch(u,init).then(function(r){var st=r.status;return r.text().then(function(tx){return [st,tx];});}).then(function(a){
-      var code=null;
-      try{var j=JSON.parse(a[1]);code=(j.status_code!==undefined)?j.status_code:((j.statusCode!==undefined)?j.statusCode:null);}catch(e){code='x';}
-      var ok=(a[0]===200&&code===0)?1:0;
-      F.res.push({id:id,ok:ok,st:a[0],c:code});
-      if(!ok)F.last=a[0]+':'+code+':'+String(a[1]).slice(0,120);
-    }).catch(function(e){F.res.push({id:id,ok:0,st:0,c:'e'});F.last='net:'+e;}).then(function(){F.inflight--;});
+    function fin(r,viaFetch){
+      if(!r.ok&&F.pref==='xhr'&&!viaFetch&&(r.c==='x'||r.st===0)){doFetch();return;}
+      if(r.ok&&viaFetch)F.pref='fetch';
+      F.res.push({id:id,ok:r.ok,st:r.st,c:r.c});
+      if(!r.ok)F.last=r.st+':'+r.c+':'+String(r.tx).slice(0,100)+' ['+(viaFetch?'fetch':'xhr')+']';
+      F.inflight--;
+    }
+    function doXhr(){
+      var x=new XMLHttpRequest();
+      x.open(t.m,u,true);x.withCredentials=true;x.timeout=15000;
+      if(b)x.setRequestHeader('Content-Type',ct);
+      x.onload=function(){fin(verdict(id,x.status,x.responseText),false);};
+      x.onerror=function(){fin({id:id,ok:0,st:0,c:'e',tx:'xhr error'},false);};
+      x.ontimeout=function(){fin({id:id,ok:0,st:0,c:'t',tx:'timeout'},false);};
+      x.send(b||null);
+    }
+    function doFetch(){
+      var init={method:t.m,credentials:'include'};
+      if(b){init.body=b;init.headers={'Content-Type':ct};}
+      fetch(u,init).then(function(r){var st=r.status;return r.text().then(function(tx){fin(verdict(id,st,tx),true);});}).catch(function(e){fin({id:id,ok:0,st:0,c:'e',tx:'net '+e},true);});
+    }
+    if(F.pref==='fetch')doFetch();else doXhr();
   };
   return 'ok';
 })()"""
