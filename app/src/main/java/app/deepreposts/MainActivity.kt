@@ -227,6 +227,19 @@ class MainActivity : Activity() {
         webViewClient = object : WebViewClient() {
             override fun onPageFinished(v: WebView, url: String?) { pageDone() }
 
+            // Google, Apple и др. не пускают вход из встроенных браузеров (получался белый экран) — не уходим на их страницы
+            override fun shouldOverrideUrlLoading(v: WebView, r: WebResourceRequest): Boolean {
+                val h = r.url.host ?: ""
+                val blocked = h.endsWith("accounts.google.com") || h.endsWith("appleid.apple.com") || h.endsWith("facebook.com") ||
+                    h.endsWith("twitter.com") || h == "x.com" || h.endsWith("kakao.com") || h.endsWith("line.me")
+                if (blocked) {
+                    dlog("заблокирован переход на сторонний вход: $h")
+                    ui.post { toast("Вход через Google, Apple и другие сервисы здесь не работает. Войдите по почте или телефону.") }
+                    return true
+                }
+                return false
+            }
+
             // видео и картинки браузеру не нужны: так страницы грузятся в разы быстрее и не тратят трафик
             override fun shouldInterceptRequest(v: WebView, r: WebResourceRequest): WebResourceResponse? {
                 if (mode == Mode.COLLECT || mode == Mode.DELETE || mode == Mode.RESOLVE) {
@@ -323,7 +336,7 @@ class MainActivity : Activity() {
                 } catch (e: Exception) { }
             }
             val ok = sessionOk()
-            tvLoginInfo.text = (if (ok) "Вход обнаружен — открываю приложение…" else "Войдите в TikTok на странице выше. После входа приложение откроется само.") +
+            tvLoginInfo.text = (if (ok) "Вход обнаружен — открываю приложение…" else "Войдите по почте или телефону (Google и Apple не работают). После входа приложение откроется само.") +
                 (if (lastLoginNet.isNotEmpty()) "\nответ TikTok: " + lastLoginNet.take(110) else "") +
                 "\ncookies: " + cookieNames().take(90)
             if (ok) {
@@ -336,7 +349,16 @@ class MainActivity : Activity() {
     }
 
     /** Кнопка внизу экрана входа. */
-    private fun manualLogin() { if (mode == Mode.LOGIN) startVerify() }
+    private fun manualLogin() {
+        if (mode != Mode.LOGIN) return
+        if (!sessionOk()) {
+            dlog("«Я вошёл» нажато, но сессии нет; cookies: " + cookieNames())
+            Toast.makeText(this, "TikTok пока не создал вход. " +
+                (if (lastLoginNet.isNotEmpty()) "Последний ответ: " + lastLoginNet.take(90) else "Завершите вход на странице выше."), Toast.LENGTH_LONG).show()
+            return
+        }
+        startVerify()
+    }
 
     // Проверка входа: браузер скрыт, поверх — интерфейс приложения с карточкой. Главная TikTok загружается
     // заново, и у неё спрашивают, чей это аккаунт. Имя НИКОГДА не вводится вручную.
@@ -1201,24 +1223,32 @@ object Scripts {
     }catch(e){}
   }
   S.tap=tap;
-  var oj=Response.prototype.json,ot=Response.prototype.text;
-  Response.prototype.json=function(){var self=this;return oj.call(this).then(function(d){tap(self.url,d);return d;});};
-  Response.prototype.text=function(){var self=this;return ot.call(this).then(function(t){
-    try{if(self.url&&String(self.url).indexOf('repost')>-1)tap(self.url,JSON.parse(t));}catch(e){}
-    return t;});};
-  var xo=XMLHttpRequest.prototype.open;
-  XMLHttpRequest.prototype.open=function(m,u){this.__u=u;return xo.apply(this,arguments);};
-  var xs=XMLHttpRequest.prototype.send;
-  XMLHttpRequest.prototype.send=function(){
-    var x=this;
-    x.addEventListener('load',function(){
-      try{
-        var u=x.responseURL||x.__u||'';
-        if(String(u).indexOf('repost')>-1&&(x.responseType===''||x.responseType==='text'))tap(u,JSON.parse(x.responseText));
-      }catch(e){}
+  var meta=new WeakMap();
+  Response.prototype.json=new Proxy(Response.prototype.json,{apply:function(t,th,a){
+    return Reflect.apply(t,th,a).then(function(d){tap(th.url,d);return d;});
+  }});
+  Response.prototype.text=new Proxy(Response.prototype.text,{apply:function(t,th,a){
+    return Reflect.apply(t,th,a).then(function(tx){
+      try{if(th.url&&String(th.url).indexOf('repost')>-1)tap(th.url,JSON.parse(tx));}catch(e){}
+      return tx;
     });
-    return xs.apply(this,arguments);
-  };
+  }});
+  XMLHttpRequest.prototype.open=new Proxy(XMLHttpRequest.prototype.open,{apply:function(t,th,a){
+    meta.set(th,String(a[1]));
+    return Reflect.apply(t,th,a);
+  }});
+  XMLHttpRequest.prototype.send=new Proxy(XMLHttpRequest.prototype.send,{apply:function(t,th,a){
+    var u0=meta.get(th)||'';
+    if(u0.indexOf('repost')>-1){
+      th.addEventListener('load',function(){
+        try{
+          var u=th.responseURL||u0;
+          if(String(u).indexOf('repost')>-1&&(th.responseType===''||th.responseType==='text'))tap(u,JSON.parse(th.responseText));
+        }catch(e){}
+      });
+    }
+    return Reflect.apply(t,th,a);
+  }});
   return 'ok';
 })()"""
 
@@ -1343,36 +1373,39 @@ object Scripts {
         D.tpl={u:rec.u,m:rec.m,b:rec.b,ct:rec.ct,hasId:!!(D.vid&&(rec.u.indexOf(D.vid)>-1||(rec.b||'').indexOf(D.vid)>-1))};
       }
     };
-    var of=window.fetch;
-    window.fetch=function(input,init){
+    var meta=new WeakMap();
+    window.fetch=new Proxy(window.fetch,{apply:function(t,th,a){
+      var input=a[0],init=a[1];
       var u=(typeof input==='string')?input:((input&&input.url)||'');
       var m=String((init&&init.method)||(input&&input.method)||'GET').toUpperCase();
-      var p=of.apply(this,arguments);
+      var p=Reflect.apply(t,th,a);
       if(m!=='GET'&&u.indexOf('/api/')>-1){
         var rec={u:u,m:m,b:bodyOf(init&&init.body),ct:ctype(init&&init.headers),s:0,c:null};
         D.net.push(rec);if(D.net.length>40)D.net.shift();
-        p.then(function(r){rec.s=r.status;return r.clone().text();}).then(function(t){
-          try{var j=JSON.parse(t);rec.c=(j.status_code!==undefined)?j.status_code:((j.statusCode!==undefined)?j.statusCode:null);}catch(e){rec.c='x';}
+        p.then(function(r){rec.s=r.status;return r.clone().text();}).then(function(tx){
+          try{var j=JSON.parse(tx);rec.c=(j.status_code!==undefined)?j.status_code:((j.statusCode!==undefined)?j.statusCode:null);}catch(e){rec.c='x';}
           judge(rec);
         }).catch(function(){});
       }
       return p;
-    };
-    var xo=XMLHttpRequest.prototype.open,xs=XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open=function(m,u){this.__m=String(m).toUpperCase();this.__u=String(u);return xo.apply(this,arguments);};
-    XMLHttpRequest.prototype.send=function(b){
-      var x=this;
-      if(x.__m&&x.__m!=='GET'&&x.__u.indexOf('/api/')>-1){
-        var rec={u:x.__u,m:x.__m,b:bodyOf(b),ct:'',s:0,c:null};
+    }});
+    XMLHttpRequest.prototype.open=new Proxy(XMLHttpRequest.prototype.open,{apply:function(t,th,a){
+      meta.set(th,{m:String(a[0]).toUpperCase(),u:String(a[1])});
+      return Reflect.apply(t,th,a);
+    }});
+    XMLHttpRequest.prototype.send=new Proxy(XMLHttpRequest.prototype.send,{apply:function(t,th,a){
+      var mt=meta.get(th);
+      if(mt&&mt.m!=='GET'&&mt.u.indexOf('/api/')>-1){
+        var rec={u:mt.u,m:mt.m,b:bodyOf(a[0]),ct:'',s:0,c:null};
         D.net.push(rec);if(D.net.length>40)D.net.shift();
-        x.addEventListener('load',function(){
-          rec.s=x.status;
-          try{var j=JSON.parse(x.responseText);rec.c=(j.status_code!==undefined)?j.status_code:((j.statusCode!==undefined)?j.statusCode:null);}catch(e){rec.c='x';}
+        th.addEventListener('load',function(){
+          rec.s=th.status;
+          try{var j=JSON.parse(th.responseText);rec.c=(j.status_code!==undefined)?j.status_code:((j.statusCode!==undefined)?j.statusCode:null);}catch(e){rec.c='x';}
           judge(rec);
         });
       }
-      return xs.apply(this,arguments);
-    };
+      return Reflect.apply(t,th,a);
+    }});
   }
   D.ticks++;
   if(D.ok)return 'done';
@@ -1425,34 +1458,40 @@ object Scripts {
   var L=window.__drL;
   if(!L){
     L=window.__drL={q:[]};
+    var meta=new WeakMap();
     var rec=function(m,u,st,t){
       try{
         var path=String(u).split('?')[0];
         if(path.indexOf('passport')<0&&path.indexOf('login')<0&&path.indexOf('verify')<0)return;
-        var d=null;try{d=JSON.parse(t);}catch(e){}
-        var dd=(d&&d.data)||{};
-        var code=(dd.error_code!==undefined)?dd.error_code:((d&&d.error_code!==undefined)?d.error_code:'');
-        var desc=dd.description||(d&&d.description)||(d&&d.message)||'';
-        L.q.push(m+' '+path.replace('https://www.tiktok.com','')+' http='+st+' код='+code+' '+String(desc).slice(0,80));
+        var short=path.replace('https://www.tiktok.com','');
+        var tx=String(t==null?'':t);
+        var d=null;try{d=JSON.parse(tx);}catch(e){}
+        if(!d){L.q.push(m+' '+short+' http='+st+' ответ не JSON, длина='+tx.length+(tx.length?' «'+tx.slice(0,30)+'»':' (пустой)'));return;}
+        var dd=(d.data&&typeof d.data==='object')?d.data:{};
+        var code=(dd.error_code!==undefined)?dd.error_code:((d.error_code!==undefined)?d.error_code:'');
+        var desc=dd.description||d.description||d.message||'';
+        L.q.push(m+' '+short+' http='+st+' код='+code+' '+String(desc).slice(0,60)+' ключи='+Object.keys(d).slice(0,6).join(',')+'/'+Object.keys(dd).slice(0,8).join(','));
       }catch(e){}
     };
-    var of=window.fetch;
-    window.fetch=function(input,init){
+    window.fetch=new Proxy(window.fetch,{apply:function(t,th,a){
+      var input=a[0],init=a[1];
       var u=(typeof input==='string')?input:((input&&input.url)||'');
       var m=String((init&&init.method)||(input&&input.method)||'GET').toUpperCase();
-      var p=of.apply(this,arguments);
-      if(m!=='GET'){p.then(function(r){var st=r.status;return r.clone().text().then(function(t){rec(m,u,st,t);});}).catch(function(){});}
+      var p=Reflect.apply(t,th,a);
+      if(m!=='GET'){p.then(function(r){var st=r.status;return r.clone().text().then(function(tx){rec(m,u,st,tx);});}).catch(function(){});}
       return p;
-    };
-    var xo=XMLHttpRequest.prototype.open,xs=XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open=function(m,u){this.__m=String(m).toUpperCase();this.__u=String(u);return xo.apply(this,arguments);};
-    XMLHttpRequest.prototype.send=function(b){
-      var x=this;
-      x.addEventListener('load',function(){
-        if(x.__m&&x.__m!=='GET'){var t='';try{t=x.responseText;}catch(e){}rec(x.__m,x.__u,x.status,t);}
-      });
-      return xs.apply(this,arguments);
-    };
+    }});
+    XMLHttpRequest.prototype.open=new Proxy(XMLHttpRequest.prototype.open,{apply:function(t,th,a){
+      meta.set(th,{m:String(a[0]).toUpperCase(),u:String(a[1])});
+      return Reflect.apply(t,th,a);
+    }});
+    XMLHttpRequest.prototype.send=new Proxy(XMLHttpRequest.prototype.send,{apply:function(t,th,a){
+      var mt=meta.get(th);
+      if(mt&&mt.m!=='GET'){
+        th.addEventListener('load',function(){var tx='';try{tx=th.responseText;}catch(e){}rec(mt.m,mt.u,th.status,tx);});
+      }
+      return Reflect.apply(t,th,a);
+    }});
   }
   return L.q.splice(0,L.q.length);
 })()"""
